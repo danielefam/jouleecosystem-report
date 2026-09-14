@@ -1,0 +1,12 @@
+% !TeX root = ../report_jouleecosystem.tex
+\chapter{Conclusion}
+
+This report describes the three parts of the energy-aware pipeline built during this internship, following how data flows through them.
+
+\textbf{JouleQuest} automated a manual and fragile measurement process. It uses a single command per experiment, adaptive burst sizing, and clock synchronization between the PC and the board. Its campaign launcher can measure a full matrix of layers over several days, picking up right where it left off. The result is a set of energy lookup tables for layers like Linear, Conv, and Attention, all measured on real hardware at batch size 1.
+
+\textbf{JouleGrad} makes these tables usable inside a training loop. It provides differentiable energy estimates and clear rules for handling inputs outside the measured regions, avoiding silent errors or zero-cost layers.
+
+\textbf{JouleNAS} closes the loop by using the measured energy as a penalty during neural architecture search (for SimpleConv and ResNet-18). This ensures the discovered architectures are optimized for their actual energy cost on the target board.
+
+The main lesson of this work is also its biggest open challenge: the energy of a full network is almost, but not exactly, the sum of its parts. The difference (up to $25\%$ on the Raspberry~Pi~5) points to cache effects that isolated measurements miss. Section \ref{sec:sum-of-parts} presents the evidence and next steps, and the Future Work chapter lays out tasks for each part of the pipeline. The tools, measurements, and open questions are all ready for the next person to take over the project.

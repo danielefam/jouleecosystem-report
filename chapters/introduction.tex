@@ -1,0 +1,24 @@
+% !TeX root = ../report_jouleecosystem.tex
+\chapter*{Introduction}
+\addcontentsline{toc}{chapter}{Introduction}
+\markboth{Introduction}{}
+
+This document is both an internship report and a practical guide. It explains what we built, how the pieces fit together, and how to take new energy measurements. You do not need prior knowledge of the project to follow along. Every chapter starts with a quick test to make sure things work, followed by the commands to run the full suite. Since working with hardware can be tricky, the text warns you about common issues in advance.
+
+\section*{The big picture}
+
+This project studies the energy consumption of AI models on edge devices (like the Raspberry~Pi~5 and Jetson boards) and uses this data to guide Neural Architecture Search. The work is split across three main tools:
+
+\begin{itemize}
+    \item \textbf{JouleQuest (Measurement)}: Runs tests on a target board and records power draw using an INA226EVM sensor. A single command gives you clean data in CSV and JSON formats.
+    \item \textbf{JouleGrad (Estimation)}: Turns JouleQuest measurements into differentiable energy estimates for common layers (like \texttt{Linear} and \texttt{Conv2d}). This allows us to use energy consumption as a penalty during training.
+    \item \textbf{JouleNAS (Search)}: A Neural Architecture Search pipeline that uses JouleGrad's estimates to find network architectures that are both accurate and energy-efficient.
+\end{itemize}
+
+A final chapter connects everything: measure with JouleQuest, build the lookup table, estimate with JouleGrad, and search with JouleNAS.
+
+\section*{How to read this document}
+
+Each chapter is self-contained, so you can jump directly to the tool you need. If you need to take new measurements, start with the JouleQuest chapter. It covers wiring, software setup, quick tests, and the main campaign commands.
+
+A quick disclaimer: hardware setups are fragile and each board behaves slightly differently. If a command fails, check the wiring and troubleshooting notes first. Configuration issues are much more common than software bugs.

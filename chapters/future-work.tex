@@ -1,0 +1,29 @@
+% !TeX root = ../report_jouleecosystem.tex
+\chapter{Future Work}
+
+All experiments in this project use a batch size of 1. Every idea proposed below keeps this assumption, because our tools (JouleGrad and JouleNAS) focus on the energy cost of a single input.
+
+\section{Measurement layer (JouleQuest)}
+
+The biggest open problem in the pipeline is here: the energy of a full network is close to, but not exactly, the sum of its individual layers. The gap ranges from about $2\%$ on Jetson boards to roughly $25\%$ on the Raspberry~Pi~5. We suspect this is due to cache effects: standalone operations run with hot caches, but a full network exceeds cache capacity, causing extra energy costs from moving data around.
+
+We will not repeat all the details here. You can find the numbers, the reasoning, and the next steps (like using performance counters to confirm the cache theory and correcting the estimator) in Section \ref{sec:sum-of-parts} of the JouleQuest chapter. If you pick up this project, start there.
+
+Beyond fixing this gap, two measurement improvements would help the entire pipeline:
+
+\begin{itemize}
+    \item \textbf{Fresh-board validation}: The Jetson Nano used for most tests broke before we could finish. A replacement board should re-run a small set of the original tests to see if the new measurements match the old ones. This validates the new hardware and shows if energy numbers are consistent across identical boards.
+    \item \textbf{Denser lookup grids}: JouleGrad estimates unknown sizes by interpolating between measured points. In regions where energy changes quickly, these estimates are less reliable. We should measure a few extra points in these sparse regions to see where the grid needs more data.
+\end{itemize}
+
+\section{Search layer (JouleNAS)}
+
+Our current experiments search for energy-aware channel masks on SimpleConv and ResNet-18 (CIFAR-10 and Imagenette). The natural next steps are:
+
+\begin{itemize}
+    \item \textbf{Deploy the pruned network on real boards}: Take the architectures selected by our search and measure them with JouleQuest. The predicted energy savings should match the real measured energy on the board. This would be the ultimate test for the entire pipeline.
+    \item \textbf{Test board-specific architectures}: Different boards have different costs (for example, convolutions cost more on CPUs than GPUs). Running the search with different lookup tables will show if the tool actually finds different "best" architectures for a Raspberry~Pi compared to an AGX Orin.
+    \item \textbf{Energy-weight sweeps}: Currently, we pick a single $\lambda_E$ penalty value by hand. A systematic sweep across many values would give us a full accuracy-energy trade-off curve for each board.
+    \item \textbf{From masks to real deployment}: Right now, the search outputs channel masks. To finish the job, we need to physically prune those channels, build the smaller model, and measure it. Only then can we confirm that the predicted savings hold up in reality.
+    \item \textbf{Cross-dataset transfer}: Does an energy-optimal mask for one dataset work well for another on the same board? A quick experiment (keeping the masks and retraining just the classifier) would show if the pruned structure depends on the dataset or just the hardware.
+\end{itemize}

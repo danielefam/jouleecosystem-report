@@ -1,0 +1,105 @@
+% !TeX root = ../report_jouleecosystem.tex
+\chapter{The Bridge: from measurements to decisions}
+
+While the three repositories are independent, this short chapter shows how they work together end-to-end and how data flows between them.
+
+\section{The pipeline}
+
+\begin{enumerate}
+    \item \textbf{Measure} (JouleQuest): A testing campaign on a board generates raw data (CSV/JSON). We process this into a summary, and finally into an energy lookup table for that specific board.
+    \item \textbf{Estimate} (JouleGrad): We load the lookup table into the \texttt{EnergyEstimator}. This tool provides differentiable energy estimates for the layer shapes we measured. By default, it refuses to guess for unmeasured shapes.
+    \item \textbf{Search} (JouleNAS): The estimator is added to the training loss as $\lambda_E \widehat{E}$. The optimizer then prunes channels that cost more energy than they provide in accuracy, using the real measured costs of the target board.
+\end{enumerate}
+
+The key strength of this pipeline is that no numbers are guessed. The energy values driving the search come from real, physical measurements on the actual hardware, rather than theoretical FLOP counts or datasheet averages.
+
+\section{From masks to physical deployment: validating with JouleQuest}
+\label{sec:joulenas_to_joulequest}
+
+So far, JouleNAS has evaluated pruned models by learning channel masks. While mask training is convenient and differentiable, it is still an emulation: the underlying PyTorch network still executes full-size dense convolutions and simply multiplies pruned channels by zero. To see real hardware energy savings and measure them on our NVIDIA Jetson board, we need to take the next step: \emph{deploying a physically smaller model}.
+
+\subsection{Selecting the target models: \texorpdfstring{$\lambda_E = 0.005$}{lambda = 0.005} discrete}
+
+To validate our methodology on physical hardware, we selected the CIFAR-10 ResNet-18 checkpoints obtained with $\lambda_E = 0.005$ in discrete mode for both benchmarked devices:
+\begin{itemize}
+    \item \textbf{NVIDIA Jetson AGX Orin}: Preserves $92.10\%$ test accuracy (compared to the $92.30\%$ dense baseline, a loss of only $0.20\%$) with a predicted energy fraction of $58.27\%$ (a $41.73\%$ energy saving).
+    \item \textbf{Raspberry Pi 5}: Preserves $92.27\%$ test accuracy (compared to the $92.31\%$ dense baseline, losing only $0.04\%$) with an estimated energy fraction of $22.54\%$ (a $77.46\%$ predicted energy saving), pruning down to $60.40\%$ active channels.
+\end{itemize}
+Both checkpoints offer substantial predicted energy reductions well above physical measurement noise and environmental fluctuations.
+
+\subsection{Reconstructing the hardware-specific pruned architectures}
+
+Using the per-layer pruning logs exported by JouleNAS, we reconstructed the materialized models inside JouleQuest:
+\begin{itemize}
+    \item \texttt{PrunedOrinCifarResNet18} (NVIDIA Jetson AGX Orin):
+    \begin{itemize}
+        \item \textbf{Stem}: $3 \to 64$.
+        \item \textbf{Stage 1}: Block 1.0 is dense ($64 \to 64 \to 64$), Block 1.1 prunes its mid-convolution to 58 ($64 \to 58 \to 64$).
+        \item \textbf{Stage 2}: Block 2.0 uses $64 \to 128 \to 127$ (shortcut $64 \to 127$); Block 2.1 uses $127 \to 128 \to 127$.
+        \item \textbf{Stage 3}: Block 3.0 uses $127 \to 253 \to 249$ (shortcut $127 \to 249$); Block 3.1 uses $249 \to 192 \to 236$.
+        \item \textbf{Stage 4}: Block 4.0 uses $236 \to 381 \to 222$ (shortcut $236 \to 222$); Block 4.1 prunes its internal layer down to 16 channels ($222 \to 16 \to 297$).
+        \item \textbf{Classifier}: Linear $297 \to 10$.
+    \end{itemize}
+    \item \texttt{PrunedPi5CifarResNet18} (Raspberry Pi 5):
+    \begin{itemize}
+        \item \textbf{Stem}: $3 \to 64$.
+        \item \textbf{Stage 1}: Both Block 1.0 and Block 1.1 remain dense at 64 channels ($64 \to 64 \to 64$).
+        \item \textbf{Stage 2}: Block 2.0 uses $64 \to 127 \to 128$ (shortcut $64 \to 128$); Block 2.1 uses $128 \to 127 \to 128$.
+        \item \textbf{Stage 3}: Block 3.0 uses $128 \to 248 \to 231$ (shortcut $128 \to 231$); Block 3.1 uses $231 \to 139 \to 238$.
+        \item \textbf{Stage 4}: Block 4.0 uses $238 \to 127 \to 248$ (shortcut $238 \to 248$); Block 4.1 uses $248 \to 64 \to 258$.
+        \item \textbf{Classifier}: Linear $258 \to 10$.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Handling residual shortcuts and BatchNorm}
+
+Reconstructing a residual architecture with variable layer sizes requires two practical adjustments:
+\begin{enumerate}
+    \item \textbf{Residual shortcut alignment}: In standard ResNet, identity shortcuts simply pass inputs forward when stride is 1. But when a block's input channels do not equal its output channels (such as Block 3.1 and Block 4.1 on both platforms), an element-wise addition would encounter mismatched shapes. In our reconstructed blocks, the shortcut automatically applies a $1 \times 1$ convolution to match channel dimensions seamlessly.
+    \item \textbf{BatchNorm adjustments}: Each BatchNorm layer is sized to match the exact active channels of its preceding convolution. While the JouleNAS energy estimate did not include BatchNorm or residual additions in its 21-term lookup, the convolutional and linear layers account for the vast majority of computation.
+\end{enumerate}
+
+\subsection{Automated testing and validation in JouleQuest}
+
+To make physical testing straightforward and repeatable, we provided dedicated validation suites in JouleQuest's campaign launcher (\texttt{run\_measurement\_campaign.sh}):
+\begin{itemize}
+    \item For Jetson AGX Orin:
+\begin{lstlisting}
+./run_measurement_campaign.sh --board agx_orin --suite pruned_validation_orin
+\end{lstlisting}
+    \item For Raspberry Pi 5:
+\begin{lstlisting}
+CPU_THREADS=4 BACKEND=cpu SLEEP_TIME=10 ./run_measurement_campaign.sh --board pi5_4threads --suite pruned_validation_pi5
+\end{lstlisting}
+\end{itemize}
+
+Each suite schedules exactly two targeted experiments:
+\begin{enumerate}
+    \item The dense CIFAR-10 ResNet-18 baseline (\texttt{ResNet18\_32\_10.pt});
+    \item The hardware-specific materialized pruned model (\texttt{PrunedOrinResNet18\_32\_10.pt} or \texttt{PrunedPi5ResNet18\_32\_10.pt}).
+\end{enumerate}
+
+Additionally, the comparison tool \texttt{validate\_pruned\_measurements.py} automatically matches the physical INA226 measurements against the JouleNAS predictions, quantifying the measured energy reduction and the composition discrepancy.
+
+Physical testing on the Raspberry~Pi~5 revealed two key operational parameters for CPU-based embedded devices:
+\begin{itemize}
+    \item \textbf{Inter-burst cooldown}: With a brief 3-second sleep, residual thermal buildup and dynamic CPU frequency scaling distorted dense baseline calibration. Extending the sleep period to 10~seconds allowed the CPU to cool completely between bursts.
+    \item \textbf{CPU thread allocation}: Because the original layer lookup table on the Raspberry~Pi~5 was profiled utilizing the full quad-core Cortex-A76 processor, we explicitly enforced 4 CPU threads (\texttt{CPU\_THREADS=4}) on the measurement runner to maintain strict hardware parity.
+\end{itemize}
+Under these stabilized, 4-thread conditions:
+\begin{itemize}
+    \item The dense ResNet-18 baseline consumed $28.38$\,mJ per inference (compared to the table-predicted $35.15$\,mJ, a $19.3\%$ composition gap).
+    \item The materialized \texttt{PrunedPi5ResNet18} consumed $11.33$\,mJ per inference (predicted $7.93$\,mJ).
+    \item Physical measurements showed a \textbf{60.08\% real-world energy reduction} on physical hardware (compared to the $77.46\%$ theoretical prediction), with only a negligible $0.04\%$ loss in test accuracy ($92.27\%$ vs $92.31\%$).
+\end{itemize}
+
+\section{Where the chain is weakest}
+
+Two weak points need attention:
+
+\begin{itemize}
+    \item \textbf{Composition}: We build the tables from isolated layer measurements, but the search uses them in full networks. This leads to a gap between the sum of the parts and the true total (Section \ref{sec:sum-of-parts}). The gap is small on Jetson boards but reaches up to about $25\%$ on the Raspberry~Pi~5.
+    \item \textbf{Coverage}: The estimator only knows about the shapes we actually measured. If the search needs an unmeasured shape, the system refuses to guess by default. This is a deliberate safety feature so we don't trust unmeasured numbers.
+\end{itemize}
+
+Keeping these points in mind, the pipeline is ready to use and, as the next chapter explains, ready to be improved.

@@ -1,0 +1,1006 @@
+% !TeX root = ../report_jouleecosystem.tex
+\chapter{JouleQuest: Measurement and data-acquisition layer}
+
+This chapter introduces \textbf{JouleQuest}, the automated measurement tool. JouleQuest runs AI models (like single Conv2d layers or full ResNet18 networks) on a target board and measures their power consumption using an INA226EVM sensor. Once you configure the hardware and software, a single command runs the entire experiment.
+
+The official documentation in the repository contains the full details. The \texttt{README.md} is the main reference for commands, and the \texttt{docs\_new/} directory provides detailed guides:
+\begin{itemize}
+    \item \texttt{experiment\_campaign.md} --- the complete campaign matrix:
+    which layer families, widths, boards, and operating conditions were
+    measured, and why those measurements were chosen.
+    \item \texttt{adaptive\_burst\_measurement.md} --- the dynamic inferences-per-burst protocol, explaining how the acquisition logic keeps each energy sample stable, repeatable, and within the intended time budgets (recommended reading, section \ref{subsec:adaptive_burst}).
+    \item \texttt{joulegrad\_energy\_estimation.md} --- the bridge between
+    raw measurements and the lookup table used downstream by JouleGrad,
+    showing how the data are transformed into a usable estimator input.
+    \item \texttt{cli\_acquisition\_report.md} --- explains how to run measurements
+    directly from the Linux terminal instead of using the graphical interface,
+    testing communication speed and commands with the sensor.
+    \item \texttt{energy\_lookup\_table\_measurement\_audit.md} --- checks that
+    the final lookup tables accurately match the real measurements taken from
+    the board.
+    \item \texttt{run\_manager\_update.md} --- explains the changes and new
+    features added to \texttt{run\_manager.py} compared to the older version of
+    JouleQuest.
+    \item \texttt{terminal\_acquisition\_full\_report.md} --- provides detailed internal
+    documentation on the terminal acquisition architecture, setup prerequisites,
+    and sequence of steps for unattended or headless measurement campaigns.
+\end{itemize}
+This chapter summarizes the full workflow and adds the context that only
+makes sense when the measurement protocol and the data processing are
+considered together.
+
+\section{Hardware configuration}
+This section extends the hardware setup described in previous work. Depending on the board's power requirements, we used two configurations:
+\begin{itemize}
+    \item \textbf{Low power} (Figure \ref{fig:low_supplier}): Raspberry PI5,
+    Jetson Nano. The supplier already has the black and red connectors ready
+    to be inserted in the board, so no extra cabling is required.
+    \item \textbf{High power} (Figure \ref{fig:high_supplier}): Jetson Nano
+    Orin, Jetson AGX Orin. The supplier needs a cable extension to work (Figure \ref{fig:high_extend}).
+\end{itemize}
+
+\begin{figure}
+    \centering
+
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/suppliers/low_front.jpg}
+        \caption{Front view.}
+        \label{fig:low_front}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/suppliers/low_back.jpg}
+        \caption{Rear label (5\,V, 5\,A output rating).}
+        \label{fig:low_back}
+    \end{subfigure}
+
+    \caption{Low-power supply used for the Raspberry~Pi~5 and Jetson Nano.}
+    \label{fig:low_supplier}
+\end{figure}
+
+\begin{figure}
+    \centering
+
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \includegraphics[width=0.8\textwidth]{figs/suppliers/high_front.jpg}
+        \caption{Front view.}
+        \label{fig:high_front}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[t]{0.48\textwidth}
+        \centering
+        \rotatebox[origin=c]{180}{\includegraphics[width=0.8\textwidth]{figs/suppliers/high_back.jpg}}
+        \caption{Rear label (19\,V, 2.37\,A output rating).}
+        \label{fig:high_back}
+    \end{subfigure}
+    
+    \vspace{0.5cm}
+    
+    \begin{subfigure}[b]{0.49\textwidth}
+        \centering
+        \rotatebox[origin=c]{270}{\includegraphics[width=0.8\textwidth]{figs/suppliers/high_extend.jpg}}
+        \caption{DC cable extension adapter.}
+        \label{fig:high_extend}
+    \end{subfigure}
+
+    \caption{High-power supply used for the Jetson Orin Nano and Jetson AGX Orin, including the required cable adapter.}
+    \label{fig:high_supplier}
+\end{figure}
+
+A few things worth double-checking before you power anything on:
+\begin{itemize}
+    \item Know your shunt resistor value and the maximum current your board can draw: they become \texttt{--shunt-ohms} and
+    \texttt{--max-expected-current-a}.
+    \item The TI-SCB is the USB box that talks to the INA226EVM and exposes a serial port on the PC. With exactly one plugged in, the software finds
+    it by itself; with more than one of the same family, pass the port explicitly.
+\end{itemize}
+
+Once all the cables are set up you can move on to the software configuration.
+
+\section{Software configuration}
+
+You do \emph{not} need the full repository on the board. JouleQuest uses a two-host setup, and each side only needs a handful of files.
+
+\subsection{The two-host setup}
+
+Two machines are involved:
+
+\begin{itemize}
+    \item \textbf{The PC} is connected to the TI-SCB over USB. It runs the
+    orchestrator (\texttt{automated\_measurement.py}) and the logger
+    (\texttt{ina226\_serial\_logger.py}), which writes the raw INA226
+    samples to CSV. Python and \texttt{pyserial} required.
+    \item \textbf{The board} (Jetson, Raspberry, \dots) runs the model. It
+    needs three files --- \texttt{run\_manager.py}, \texttt{runner.py},
+    \texttt{base\_runner.py} and the \texttt{layers} directory for more advanced experiments (e.g. resnet, attention).
+\end{itemize}
+
+To prepare a \emph{new} board, copy the inference-side scripts over SSH:
+
+\begin{lstlisting}
+scp -r run_manager.py runner.py base_runner.py layers\
+  -o ProxyJump=JUMP_USER@JUMP_HOST \
+  BENCH_USER@INFERENCE_HOST:/path/to/JouleQuest/
+\end{lstlisting}
+
+On the PC side, clone the repository and install the acquisition
+dependencies (the logger needs \texttt{pyserial}; the result-processing
+scripts need \texttt{pandas}, \texttt{scikit-image} and
+\texttt{matplotlib}):
+
+\begin{lstlisting}
+python -m pip install -r Docs/INA226EVM/requirements.txt
+python -m pip install pandas scikit-image matplotlib
+\end{lstlisting}
+
+\subsection{SSH configuration}
+
+SSH is the most common failure point of the whole setup: \textbf{if SSH asks for a password, the run fails}, because the automation runs with
+\texttt{BatchMode=yes} and cannot type one. Set up key based authentication
+\emph{before} launching anything --- the quickest way is
+\texttt{ssh-copy-id} --- and remember also to authorize the jump host, if
+your board is reached through one.
+
+The last piece of configuration is a small JSON file that tells the PC where
+the board is: \texttt{measurement\_hosts.local.json}. 
+You should start editing it with any text editor:
+
+\begin{lstlisting}
+cp measurement_hosts.example.json measurement_hosts.local.json
+nano measurement_hosts.local.json
+\end{lstlisting}
+
+This is all there is inside --- just replace the placeholders with the real
+hostnames, user names and paths:
+
+\begin{lstlisting}
+{
+  "runner_host": "BENCH_USER@INFERENCE_HOST",
+  "jump_host": "JUMP_USER@JUMP_HOST",
+  "remote_directory": "/path/to/joulequest",
+  "remote_python": "/path/to/python",
+  "remote_manifest_directory": "measurement_manifests",
+  "ssh_connect_timeout_s": 10.0,
+  "ssh_options": []
+}
+\end{lstlisting}
+
+To give you a concrete idea, this is a real configuration used for the
+Raspberry~Pi~5 measurements (addresses anonymized for this report; the
+original file stays on the measurement host PC):
+
+\begin{lstlisting}
+{
+  "runner_host": "pi@<BOARD_IP>",
+  "jump_host": "<USER>@<JUMP_HOST>",
+  "remote_directory": "/home/pi/energybanera",
+  "remote_python": "/home/pi/miniconda3/bin/python",
+  "remote_manifest_directory": "measurements_pi5",
+  "ssh_connect_timeout_s": 10.0,
+  "ssh_options": []
+}
+\end{lstlisting}
+
+In words: \texttt{runner\_host} is the board under test,
+\texttt{jump\_host} is the gateway used to reach it (leave it empty if the
+board is directly reachable), \texttt{remote\_directory} is where the
+runner scripts live on the board, and \texttt{remote\_python} is the Python
+interpreter on the board --- point it at the environment with PyTorch
+installed. The remaining fields should not need changes.
+
+Since it contains the addresses of the team's machines, keep it private: it
+is already listed in \texttt{.gitignore}, so it will not end up in Git by mistake.
+
+Once the file is in place, run this command:
+
+\begin{lstlisting}
+ssh -J JUMP_USER@JUMP_HOST \
+  -o BatchMode=yes \
+  BENCH_USER@INFERENCE_HOST \
+  'printf "SSH_OK: "; hostname'
+\end{lstlisting}
+
+If the output is \texttt{SSH\_OK:} followed by the board's hostname, the
+configuration is complete and you can move on to running measurements.
+
+\section{How it works, technically}
+
+You \emph{can} skip this section and still use JouleQuest --- but you
+shouldn't. A quick read will help you understand the files you get back and
+spot unusual results, it also explains the reasoning behind some
+parameter choices, like the sampling rate. Nothing here requires action from
+you: everything described below happens automatically.
+
+\subsection{One experiment, start to finish}
+
+Each experiment is driven by \texttt{automated\_measurement.py} on the PC,
+and goes through the same steps every time:
+
+\begin{enumerate}
+    \item The PC starts the experiment on the board over SSH.
+    \item The board runs a \textbf{warm-up} (not measured): the first forward
+    pass is slower than the others, because the GPU and the libraries need a
+    moment to get ready, so one burst is executed and deliberately thrown away.
+    \item The board runs a short \textbf{calibration} (not measured): it
+    times a few small batches to learn how long one inference takes, and
+    from that it computes how many inferences are needed to make each
+    measured burst long enough.
+    \item The board tells the PC to \textbf{start recording}: the INA226
+    logger begins writing power samples to a CSV file.
+    \item The \textbf{measured cycles} run: a few bursts with idle pauses in
+    between, plus some idle time before and after, so the baseline
+    consumption can be subtracted later.
+    \item The board tells the PC to \textbf{stop recording}. The logger
+    closes the file \emph{before} the board writes its report, so this final
+    bookkeeping never pollutes the measurement.
+    \item The PC downloads the report (called \emph{manifest}), saves it next
+    to the CSV, and deletes the copy on the board to save space (use
+    \texttt{--keep-remote-manifest} if you want to keep it for debugging).
+\end{enumerate}
+
+Each experiment leaves exactly two files behind:
+
+\begin{lstlisting}
+measurements/runs/<campaign_id>.csv    # raw INA226 samples
+measurements/runs/<campaign_id>.json   # the manifest
+\end{lstlisting}
+
+The manifest is the experiment's report card: what was measured, how long
+each burst lasted, the real sampling rate, and a \texttt{quality\_status}
+flag. The command's exit code sums everything up: \texttt{0} all good,
+\texttt{2} the model ran but the recording is invalid, \texttt{1} the experiment failed, \texttt{130} you stopped it with \texttt{Ctrl+C} (and
+everything was cleaned up properly).
+
+Furthermore, to guarantee rigorous benchmarking on multi-core CPU targets (such as the Raspberry~Pi~5), the execution harness supports an explicit \texttt{CPU\_THREADS} variable forwarded by \texttt{run\_measurement\_campaign.sh} over SSH. The execution environment---including configured threads, active PyTorch thread count, and available cores---is certified directly in the manifest under \texttt{runner\_environment}. Because this metadata is recorded during the initial setup phase outside the measurement window, it introduces zero I/O or CPU overhead during the active inference bursts.
+
+\subsection{Why the bursts are ``adaptive''} \label{subsec:adaptive_burst}
+
+Older versions of this project ran the same huge number of inferences for
+every layer. That worked, but it wasted a lot of time on slow layers while
+being too short to be meaningful for fast ones. Now the length of each burst
+is computed automatically, so that every measured region is long enough both
+in \emph{time} and in \emph{number of samples}:
+
+$$
+T_{\text{required}} =
+m \cdot \max\!\left(T_{\text{target}},\,
+\frac{N_{\text{samples,min}}}{f_s}\right),
+$$
+
+where:
+\begin{itemize}
+    \item $f_s$ is how many samples per second the INA226 takes
+    (\texttt{--sampling\_rate\_hz});
+    \item $N_{\text{samples,min}}$ is the minimum number of samples you want
+    inside each active region (\texttt{--min\_active\_samples});
+    \item $m$ is a safety margin (\texttt{--burst\_duration\_margin},
+    default $1.2$, i.e. 20\% longer than strictly needed).
+\end{itemize}
+In words: the burst must last at least \texttt{--target\_burst\_seconds},
+\emph{and} it must contain enough samples for the statistics to be
+meaningful --- whichever of the two asks for more time wins, plus the safety
+margin. For my experiments I have not used a target in seconds but in a minimum amount of active samples = 100.
+
+\textbf{One practical note on the sampling rate}. The INA226 can, in principle, go
+above the 100\,Hz we use in the campaigns, so it is natural to ask why
+we are limitating it to 100\,Hz. The reason is the communication overhead: every sample
+requires the PC to talk to the sensor through the TI-SCB and read several
+internal registers, and that back-and-forth takes time. When we pushed the
+requested rate higher, the transfer could not keep up and samples were
+actually \emph{lost} --- the achieved rate became irregular and lower than
+what we obtained by simply asking for 100\,Hz. This is not a theoretical
+limit: we observed it empirically by comparing requested versus achieved
+sampling rates, and 100\,Hz turned out to be the fastest setting at which
+no samples go missing. The achieved rate is recorded in every manifest, so
+you can always check that your acquisition behaved.
+
+Once calibration has measured how long one inference takes
+($t_{\text{inference}}$), the number of inferences per burst is just
+$\lceil T_{\text{required}} / t_{\text{inference}} \rceil$. This estimate is
+double-checked before the real measurement: the runner performs a few extra
+\emph{validation} bursts (not measured) with exactly that count and verifies
+that even the shortest one is long enough. If not, the count is raised
+automatically and checked again for at most \texttt{--calibration-sizing-max-attempts} times.
+
+\subsection{Clock synchronization}
+
+There is one subtlety worth knowing about. The power samples are timestamped
+by the PC, but the bursts run on the board --- and the two clocks do not
+agree perfectly. To match each burst with the right samples, the two
+machines compare their clocks right before and after the recording, and the
+manifest stores the translated time windows.
+
+If the two clocks can be aligned precisely enough, processing uses those
+windows directly. If not (for example the network was slow during the
+comparison), nothing is lost: the processing script finds the active regions
+on its own, by looking at where the power trace rises above the baseline
+(Otsu thresholding plus hysteresis, a standard image-segmentation technique
+applied to the trace). The manifest records which method was used, so you
+can always check.
+
+\subsection{Manifest structure and quality flags}
+\label{subsec:manifest_structure}
+
+Every completed experiment leaves behind two files: a raw CSV trace of INA226 electrical readings and a companion JSON audit called the \emph{manifest} (using \texttt{schema\_version: 2}). While the CSV stores timestamps, voltages, and currents, the manifest records the complete execution history, including workload policies, latency calibration, clock synchronization, cycle-level timing boundaries, and data-quality assessments.
+
+Listing~\ref{lst:manifest_example} shows the structure of a representative manifest produced by JouleQuest:
+
+\begin{lstlisting}[caption={Representative structure of a JouleQuest manifest JSON (\texttt{schema\_version: 2}).}, label={lst:manifest_example}]
+{
+  "schema_version": 2,
+  "campaign_id": "20260813T215234Z_ResNet18_224_1000_bs1_b901e0d5",
+  "status": "COMPLETE",
+  "quality_status": "OK",
+  "quality_flags": [],
+  "model_path": "Models/CUDA/ResNet18/ResNet18_224_1000.pt",
+  "backend": "cuda",
+  "input_batch_size": 1,
+  "calibration": {
+    "target_seconds": 1.0,
+    "repetitions": 8,
+    "estimated_latency_seconds": 0.00535,
+    "relative_mad": 0.0041,
+    "coefficient_of_variation": 0.0052,
+    "quality_flags": []
+  },
+  "burst_validation": {
+    "rounds": 1,
+    "passed": true,
+    "validation_min_seconds": 1.218,
+    "validation_median_seconds": 1.221
+  },
+  "acquisition": {
+    "requested_sampling_rate_hz": 100.0,
+    "achieved_sampling_rate_hz": 99.9998,
+    "sample_count": 47443,
+    "clock_alignment": {
+      "status": "COMPLETE",
+      "uncertainty_seconds": 0.0021,
+      "classification_eligible": true
+    }
+  },
+  "measurement": {
+    "total_executed_inferences": 22800,
+    "cycles": [
+      {
+        "cycle": 1,
+        "requested_inferences": 228,
+        "executed_inferences": 228,
+        "elapsed_seconds": 1.220,
+        "estimated_ina226_samples": 122.0,
+        "quality_flags": [],
+        "start_event": {
+          "monotonic_seconds": 1542.31,
+          "aligned_elapsed_seconds": 5.02
+        },
+        "end_event": {
+          "monotonic_seconds": 1543.53,
+          "aligned_elapsed_seconds": 6.24
+        }
+      }
+    ]
+  }
+}
+\end{lstlisting}
+
+\subsubsection{Where quality flags are located}
+Quality metrics are tracked across multiple levels within the manifest hierarchy:
+\begin{itemize}
+    \item \textbf{Cycle-level quality flags} (\texttt{cycles[i].quality\_flags}): Each measured cycle tracks its own local flags. If a specific burst suffers from anomalous duration or sample starvation, the diagnostic flag is recorded directly in that cycle's entry.
+    \item \textbf{Calibration quality flags} (\texttt{calibration.quality\_flags}): Records stability or convergence anomalies encountered while determining single-inference latency prior to acquisition.
+    \item \textbf{Global status and aggregate flags}: Located at the root of the JSON object, \texttt{quality\_flags} gathers the deduplicated union of all flags emitted across the entire run. If this list is empty, \texttt{quality\_status} is assigned \texttt{"OK"}. If one or more flags are present anywhere, \texttt{quality\_status} becomes \texttt{"REVIEW"}.
+\end{itemize}
+
+\subsubsection{Causes of the REVIEW flag: undersampling and duration anomalies}
+The \texttt{REVIEW} status indicates that an experiment ran to completion (\texttt{status: COMPLETE}) but experienced timing or resolution discrepancies that warrant inspection:
+\begin{enumerate}
+    \item \textbf{Undersampling (\texttt{UNDER\_RESOLVED})}: This flag is triggered for a cycle when the number of actual power samples captured during the forward pass falls below the required threshold:
+    $$
+    N_{\text{actual}} = t_{\text{elapsed}} \cdot f_s < N_{\text{samples,min}}.
+    $$
+    With our default parameters ($f_s = 100\,\text{Hz}$ and $N_{\text{samples,min}} = 100$), an active burst must last at least $1.0\,\text{s}$. If a burst finishes in less than one second, the cycle captures fewer than 100 samples. This occurs when an operation executes faster than calibration predicted, leaving too few discrete measurement points to separate the steady-state plateau from transient edge effects.
+    
+    \item \textbf{Severe duration anomaly (\texttt{DURATION\_ANOMALY})}: A more severe timing distortion flag is raised when the actual measured duration deviates by more than a factor of two from the calibration estimate:
+    $$
+    \frac{t_{\text{elapsed}}}{t_{\text{estimated}}} < 0.5 \quad \text{or} \quad \frac{t_{\text{elapsed}}}{t_{\text{estimated}}} > 2.0.
+    $$
+    This condition captures two distinct anomalies:
+    \begin{itemize}
+        \item \emph{Severe undersampling} ($< 0.5\times$): The execution completed in less than half the expected time. This severely depresses the sample count and usually triggers both \texttt{DURATION\_ANOMALY} and \texttt{UNDER\_RESOLVED}.
+        \item \emph{Heavy oversampling and latency dilation} ($> 2.0\times$): The execution took more than double the expected time. This can occur when the device experiences unexpected latency spikes due to memory bus contention, GPU thermal throttling, or CPU background scheduling.
+    \end{itemize}
+    
+    \item \textbf{Calibration instability flags}: A \texttt{REVIEW} can also stem from pre-acquisition calibration: \texttt{CALIBRATION\_UNSTABLE} is raised when the latency relative MAD or coefficient of variation exceeds 15\%, and \texttt{CALIBRATION\_SIZING\_NOT\_CONVERGED} indicates that the pilot failed to reach the 1.0\,s target duration within 5 attempts.
+\end{enumerate}
+
+\subsubsection{Why oversampled runs were treated as valid}
+A crucial design choice was made regarding runs flagged for \texttt{REVIEW} due to oversampling. When generating downstream energy lookup tables (\texttt{build\_energy\_lookup\_table.py}), we explicitly accept experiments whose quality status is either \texttt{"OK"} or \texttt{"REVIEW"}:
+\begin{lstlisting}[language=Python]
+data = data[data["quality_status"].isin(["OK", "REVIEW"])]
+\end{lstlisting}
+
+This decision is physically grounded: \textbf{heavy oversampling does not harm energy estimation, whereas undersampling does}.
+When a burst runs longer than planned, the INA226 simply captures \emph{more} discrete power readings across the execution plateau ($N_{\text{actual}} \gg 100$). Because energy is calculated by numerical integration over time ($E = \int [P(t) - P_{\text{idle}}]\,dt$), having a denser set of discrete samples across the plateau improves or preserves the numerical precision of the Riemann sum without introducing systematic bias. 
+
+In contrast, severe undersampling risks missing transient features and provides insufficient points to compute a clean trimmed mean. By accepting oversampled experiments marked as \texttt{REVIEW}, we retain high-fidelity measurements that would otherwise be discarded unnecessarily, preserving complete coverage in our lookup tables.
+
+\section{Running the measurements}
+
+\subsection{Smoke test: prove everything works in five minutes}
+
+Before launching anything long, run this minimal experiment. It touches the
+whole chain (SSH, inference, recording, file transfer) with a small model,
+and finishes in a few minutes:
+
+\begin{lstlisting}
+python automated_measurement.py \
+  --connection-config measurement_hosts.local.json \
+  --backend cuda \
+  --output-directory measurements/runs \
+  --shunt-ohms 0.012 \
+  --max-expected-current-a 5.0 \
+  --number_of_cycles 2 \
+  --sleep_time 3 \
+  --target_burst_seconds 2 \
+  --model Models/CUDA/Linear/Linear_64_64.pt
+\end{lstlisting}
+
+So what does each argument mean? Here is the smoke test, decoded:
+
+\begin{itemize}
+    \item \texttt{--connection-config}: the JSON file from the SSH section
+    --- who the board is and how to reach it.
+    \item \texttt{--backend}: where the model runs on the board
+    (\texttt{cuda}, \texttt{cpu}, or \texttt{tpu}). Raspberry PIs run only on cpu mode.
+    \item \texttt{--output-directory}: where the CSV/JSON pair is saved on
+    the PC.
+    \item \texttt{--shunt-ohms} / \texttt{--max-expected-current-a}: the
+    electrical settings of your measurement chain (the two numbers from the
+    hardware section).
+    \item \texttt{--number\_of\_cycles}: how many bursts are measured
+    (default 5; we use 2 here just to be quick).
+    \item \texttt{--sleep\_time}: idle seconds between bursts (default 10).
+    \item \texttt{--target\_burst\_seconds}: how long each burst should last
+    (2 s here instead of the default 10, again just to be quick).
+\end{itemize}
+
+These are only the most common ones. The full list --- warm-up, calibration,
+validation, clock sync, idle windows and all the defaults --- is documented
+in the CLI parameter reference table of
+\texttt{docs\_new/adaptive\_burst\_measurement.md} (Section 9), and every
+value is also recorded in the manifest of each experiment.
+
+One thing that can confuse at first: \texttt{--model} is a path
+\emph{on the board}, while \texttt{--output-directory} is \emph{on the PC}.
+And ``path'' is maybe not so accurate as word: a full file path is only needed if
+you actually have a checkpoint to load. The notation above
+(\texttt{Models/CUDA/Linear/Linear\_64\_64.pt}) is enough --- if the file
+does not exist, the runner simply reads the base path (\texttt{Linear\_64\_64.pt}), extracts the
+architecture and dimensions from the name, and starts from randomly
+initialized parameters. This is the default configuration, and it is exactly
+what you want for energy measurements.
+
+With exactly one TI-SCB connected you can omit \texttt{--port}; otherwise
+find the device path with \texttt{ls /dev/serial/by-id/} and pass it
+explicitly.
+
+If the command exits with code \texttt{0} and a fresh CSV/JSON pair appears
+in the output directory, the setup works and you can move to the real thing.
+
+\subsection{Full suite: the campaign launcher}
+
+One experiment at a time is nice for testing, but measuring the complete
+layer matrix (Linear, Conv, attention, and friends) by hand would take
+forever. Before showing the command, one design choice is worth explaining,
+because it is deliberate: \texttt{automated\_measurement.py} runs
+\emph{exactly one} experiment and nothing more. Scheduling the whole
+campaign is left to a separate shell script,
+\texttt{run\_measurement\_campaign.sh}, which simply calls the Python script
+once per model. Keeping the two roles separated means the Python code stays
+focused on doing one experiment well (SSH, calibration, recording,
+manifest), and you remain free to run any single configuration by hand ---
+like the smoke test above, or any custom parameter set you need --- without
+touching the campaign machinery. The launcher is only a convenience on top:
+
+\begin{lstlisting}
+./run_measurement_campaign.sh --board BOARD_LABEL --suite all
+\end{lstlisting}
+
+Before launching it for real, you can see every command it would run ---
+without starting anything:
+
+\begin{lstlisting}
+./run_measurement_campaign.sh --board BOARD_LABEL --suite all --dry-run
+\end{lstlisting}
+
+Things worth knowing:
+\begin{itemize}
+    \item One invocation measures exactly one board. When it finishes, power
+    down, swap the board, update the connection file and the current range,
+    and relaunch with a new \texttt{BOARD\_LABEL}.
+    \item Results go to \texttt{measurements/runs/BOARD\_LABEL/}. Experiments
+    that already have a \texttt{COMPLETE} manifest are skipped, so
+    \texttt{Ctrl+C} is safe: relaunch with the same board label and the
+    campaign resumes where it stopped.
+    \item It stops at the first error by default. If you prefer to collect
+    failures and fix them later, use \texttt{--continue-on-error}.
+    \item All parameters (cycles, sampling rate, model matrix, \dots) are
+    variables at the top of the script, and can be overridden with
+    environment variables --- no need to edit the script itself.
+    \item If the board tends to heat up, add a pause between experiments
+    with \texttt{--experiment-cooldown-seconds 60}.
+\end{itemize}
+
+The complete campaign matrix (which Linear, Conv and attention
+configurations are measured, and with which parameters) is documented in
+\texttt{docs\_new/experiment\_campaign.md}.
+
+\subsection{Current measurement setup and campaign parameters}
+\label{subsec:campaign_setup}
+
+The full execution parameters for each campaign are orchestrated by \texttt{run\_measurement\_campaign.sh} and enforced on the target board by \texttt{run\_manager.py}. To guarantee that measurements across different boards (Raspberry~Pi~5, Jetson Nano, Jetson Orin Nano, Jetson AGX Orin) are reproducible, thermally stable, and statistically reliable, the campaign enforces a standardized set of operational hyperparameters.
+
+Table~\ref{tab:campaign_parameters} details the essential configuration parameters governing each measurement run:
+
+\begin{table}
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{3pt}
+    \renewcommand{\arraystretch}{1.15}
+    \begin{tabular}{@{} p{2.5cm} p{4.3cm} p{6.5cm} @{}}
+        \toprule
+        \textbf{Category} & \textbf{Parameters and Values} & \textbf{Operational Role and Physical Rationale} \\
+        \midrule
+        \textbf{Workload cycles} & 
+        \texttt{NUMBER\_OF\_CYCLES = 100} \newline
+        \texttt{BATCH\_SIZE = 1} & 
+        100 measured repetitions ensure high statistical significance, averaging out scheduling jitter and power rail fluctuations. \\
+        \midrule
+        \textbf{Burst duration} & 
+        \texttt{SAMPLING\_RATE\_HZ = 100} \newline
+        \texttt{MIN\_ACTIVE\_SAMPLES = 100} \newline
+        \texttt{BURST\_DURATION\_MARGIN = 1.2} & 
+        100\,Hz avoids USB/serial congestion; a minimum of 100 samples guarantees $T_{\text{burst}} \ge 1.0$\,s, with a 20\% safety margin ($m = 1.2$). \\
+        \midrule
+        \textbf{Warm-up \& Rest} & 
+        \texttt{WARMUP\_INFERENCES = 3} \newline
+        \texttt{SLEEP\_TIME = 3\,s} \newline
+        \texttt{EXPERIMENT\_COOLDOWN = 10\,s} & 
+        3 unmeasured passes prime CUDA kernels and memory allocators; 3\,s inter-burst sleep and 10\,s inter-run pause prevent cumulative thermal drift. \\
+        \midrule
+        \textbf{Calibration} & 
+        \texttt{CALIBRATION\_TARGET = 1.0\,s} \newline
+        \texttt{CALIBRATION\_REPETITIONS = 8} \newline
+        \texttt{MAX\_RELATIVE\_MAD = 0.15} & 
+        Measures median latency across 7 retained runs (first discarded); rejects calibration if relative MAD or coefficient of variation exceeds 15\%. \\
+        \midrule
+        \textbf{Validation gate} & 
+        \texttt{VALIDATION\_REPETITIONS = 3} \newline
+        \texttt{VALIDATION\_SAFETY\_} \newline
+        \texttt{MARGIN = 1.1} & 
+        3 unmeasured verification bursts confirm duration before recording; scales count if execution runs faster than expected (up to 3 rounds). \\
+        \midrule
+        \textbf{Idle baselines} & 
+        \texttt{LEADING\_IDLE = 5\,s} \newline
+        \texttt{TRAILING\_IDLE = 30\,s} \newline
+        \texttt{SAFETY\_MARGIN = 2\,s} & 
+        Captures pre- and post-workload quiet windows, enabling accurate subtraction of baseline board static consumption ($P_{\text{idle}}$). \\
+        \midrule
+        \textbf{Electrical limits} & 
+        \texttt{SHUNT\_OHMS = 0.012\,$\Omega$} \newline
+        \texttt{MAX\_EXPECTED\_CURRENT = 5.0\,A} & 
+        Hardware sense resistor value ($12\,\text{m}\Omega$) and full-scale current limit programmed into the INA226 calibration register. \\
+        \bottomrule
+    \end{tabular}
+    \caption[Key configuration parameters in campaign launcher]{Key configuration parameters in \texttt{run\_measurement\_campaign.sh} governing the automated acquisition protocol.}
+    \label{tab:campaign_parameters}
+\end{table}
+
+A few characteristics of this setup warrant particular emphasis:
+\begin{itemize}
+    \item \textbf{Statistical robustness through 100 cycles}: Running 100 cycles per layer produces 100 independent active-region energy measurements. This large sample count dampens operating-system noise, thread scheduling differences, and background memory bus activity, providing narrow confidence intervals.
+    \item \textbf{Strict exclusion of setup overhead}: The 3 warm-up inferences and all calibration sizing bursts run strictly \emph{before} the INA226 acquisition command is issued. As a result, model initialization and kernel compilation overhead never contaminate the measured CSV trace.
+    \item \textbf{Thermal discipline}: Because energy consumption drifts as silicon temperature rises, maintaining thermal equilibrium is critical. The 3-second inter-cycle sleep, the 30-second trailing idle, and the 10-second inter-experiment cooldown ensure that boards dissipate heat steadily and do not enter thermal throttling regimes during the campaign.
+\end{itemize}
+
+\subsection{What a full campaign actually measures}
+
+The launcher groups the experiments into \emph{suites}, selected with
+\texttt{--suite} (comma-separated, or \texttt{all}). The available suites
+are listed below (see Table~\ref{tab:campaign-suite-counts} for the full composition of \texttt{all}):
+
+\begin{itemize}
+    \item \textbf{linear} (121 experiments): all input/output pairs over
+    the sizes 64--8192, plus the low-feature points 1, 8 and 32 added for
+    the pruning-oriented coverage (the combined $11 \times 11$ grid);
+    \item \textbf{conv} (1648 experiments): the generic Conv matrix,
+    after removing the channel/image-size combinations deliberately skipped
+    by the launcher (see table~\ref{tab:conv-matrix}), plus two pruning extensions --- a complete
+    $3{\times}3$/pad-1 grid at spatial size 2 and a complete $1{\times}1$
+    pointwise grid over log-spaced channels;
+    \item \textbf{attention} (105 experiments): sequence lengths
+    128--2048 $\times$ embedding dimensions 128--4096 $\times$ head
+    dimensions 32, 64, 128, always at batch 1;
+    \item \textbf{rotaryattention} (35 experiments): the same sequence and
+    embedding axes for the rotary variant, with the head dimension fixed
+    at 64;
+    \item \textbf{lenet} (12 experiments): the complete LeNet model plus
+    its 11 standalone operations --- the material for the sum-of-parts
+    analysis of Section \ref{sec:sum-of-parts};
+    \item \textbf{resnet18} (30 experiments): the complete ResNet-18 plus
+    one experiment for each distinct operation shape in it (convolutions,
+    BatchNorm, residual adds, pooling, the final Linear);
+    \item \textbf{resnet50} (54 experiments): the same decomposition for
+    the bottleneck-based ResNet-50.
+\end{itemize}
+
+\begin{table}
+    \centering
+    \begin{tabular}{l r l}
+        \hline
+        \textbf{Suite} & \textbf{Experiments} & \textbf{Included by \texttt{all}} \\
+        \hline
+        Linear & 121 & yes \\
+        Conv & 1648 & yes \\
+        Attention & 105 & yes \\
+        Rotary attention & 35 & yes \\
+        LeNet + components & 12 & yes \\
+        \hline
+        \textbf{Default \texttt{all} total} & \textbf{1921} & --- \\
+        \hline
+        ResNet-18 + components & 30 & no \\
+        ResNet-50 + components & 54 & no \\
+        \hline
+        \textbf{All suites together} & \textbf{2005} & --- \\
+        \hline
+    \end{tabular}
+    \caption{Number of experiments scheduled by each campaign suite with the
+    default axes. \texttt{all} includes only the basic layer suites and
+    LeNet; the ResNet suites must be requested explicitly.}
+    \label{tab:campaign-suite-counts}
+\end{table}
+
+\paragraph{Linear experiment matrix (Table~\ref{tab:linear-matrix}).}
+The Linear suite benchmarks fully-connected layers across a wide range of feature dimensions. In Table~\ref{tab:linear-matrix}:
+\begin{itemize}
+    \item \textbf{Rows represent the input feature dimension} ($d_{\text{in}}$).
+    \item \textbf{Columns represent the output feature dimension} ($d_{\text{out}}$).
+\end{itemize}
+The baseline matrix comprises the symmetric Cartesian product over eight powers of two: $d_{\text{in}}, d_{\text{out}} \in \{64, 128, 256, 512, 1024, 2048, 4096, 8192\}$. These 64 standard configurations are shown as filled bullets ($\bullet$). 
+
+When applying neural architecture search or channel pruning, layers are frequently trimmed down to very narrow widths. To ensure the surrogate energy model can interpolate accurately without large extrapolation errors near zero, the launcher introduces three low-feature knots: $\{1, 8, 32\}$ along both axes. The open circles ($\circ$) represent these extra pruning points, scheduled whenever at least one dimension belongs to $\{1, 8, 32\}$. Because combinations already present in the original $8 \times 8$ grid are not duplicated, this adds $(8+3)^2 - 8^2 = 57$ additional points.
+
+Each entry in Table~\ref{tab:linear-matrix} maps one-to-one to a standalone model file:
+$$
+\texttt{Models/CUDA/Linear/Linear\_<input\_size>\_<output\_size>.pt}
+$$
+(for example, \texttt{Linear\_128\_2048.pt}), executed at batch size 1. In total, the Linear suite comprises $64 + 57 = 121$ distinct benchmark models.
+
+\begin{table}
+    \centering
+    \setlength{\tabcolsep}{3.5pt}
+    \begin{tabular}{r|*{8}{c}|*{3}{c}}
+        \hline
+        \textbf{$d_{\text{in}}\!\setminus\!d_{\text{out}}$} & \textbf{64} & \textbf{128} & \textbf{256} &
+        \textbf{512} & \textbf{1024} & \textbf{2048} & \textbf{4096} &
+        \textbf{8192} & \textbf{1} & \textbf{8} & \textbf{32} \\
+        \hline
+        64   & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        128  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        256  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        512  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        1024 & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        2048 & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        4096 & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        8192 & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\circ$ & $\circ$ & $\circ$ \\
+        \hline
+        1    & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ \\
+        8    & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ \\
+        32   & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ & $\circ$ \\
+        \hline
+    \end{tabular}
+    \caption{Linear experiment matrix. Rows represent input feature dimensions ($d_{\text{in}}$) and columns represent output feature dimensions ($d_{\text{out}}$). Filled bullets ($\bullet$) are the baseline $8 \times 8$ grid; open circles ($\circ$) are the 57 extra pruning points added by $\{1, 8, 32\}$, yielding $64+57=121$ Linear experiments.}
+    \label{tab:linear-matrix}
+\end{table}
+
+\paragraph{Generic Conv measurement matrix (Table~\ref{tab:conv-matrix}).}
+The convolutional space spans four dimensions: input channels, spatial feature-map resolution, output channels, and kernel/padding geometries. Table~\ref{tab:conv-matrix} visualizes the primary base configuration plane:
+\begin{itemize}
+    \item \textbf{Rows represent the input channel depth}: $C_{\text{in}} \in \{1, 2, 4, 8, 16,$ $32, 64, 128, 256, 512\}$.
+    \item \textbf{Columns represent the square spatial resolution}: $H = W \in \{32, 64, 128, 256, 512, 1024\}$.
+\end{itemize}
+
+A naive Cartesian product of 10 channel counts $\times$ 6 spatial resolutions would yield 60 pairs. However, modern computer-vision architectures do not combine deep channel stacks with massive spatial resolutions (such as 512 channels at $1024 \times 1024$), and allocating such intermediate activation tensors would trigger out-of-memory errors on edge devices. Therefore, the launcher enforces resolution caps: channels $1$--$8$ permit resolutions up to 1024; channels $16$--$32$ up to 512; channels $64$--$128$ up to 256; channel 256 up to 128; and channel 512 up to 64. Combinations exceeding these caps are skipped (marked by dashes `---' in Table~\ref{tab:conv-matrix}), leaving exactly 47 valid base pairs (marked by bullets `$\bullet$').
+
+Crucially, unlike the Linear matrix where each bullet represents a single experiment, \textbf{each bullet ($\bullet$) in Table~\ref{tab:conv-matrix} expands multiplicatively into 32 distinct benchmarking experiments}. Each valid $(C_{\text{in}}, \text{resolution})$ pair is crossed with:
+\begin{enumerate}
+    \item \textbf{8 output-channel values}: $C_{\text{out}} \in \{1, 8, 16, 32, 64, 128, 256, 512\}$.
+    \item \textbf{4 kernel and padding configurations}: $(k=3, p=0)$, $(k=3, p=1)$, $(k=5, p=0)$, and $(k=5, p=1)$ (with stride fixed to 1).
+\end{enumerate}
+This 32-fold expansion produces $47 \times 8 \times 4 = 1504$ generic convolutional experiments. Each model follows the naming scheme:
+\begin{center}
+\footnotesize
+\texttt{Conv\_<input\_channels>\_<image\_size>\_<kernel>\_<padding>\_<out\_channels>.pt}
+\end{center}
+(for example, \texttt{Conv\_256\_128\_3\_1\_512.pt} or \texttt{Conv\_512\_64\_3\_1\_512.pt}).
+
+Finally, two specialized pruning extensions supplement this generic matrix:
+\begin{itemize}
+    \item \textbf{Small-spatial $3\times 3$ grid} (80 experiments): tests spatial size $2 \times 2$ with padding 1 across all 10 input channels and 8 output channels ($10 \times 8 = 80$).
+    \item \textbf{Pointwise $1\times 1$ grid} (64 experiments): tests $1\times 1$ kernels ($p=0$) across channels $\{1, 8, 64, 512\}$ and spatial sizes $\{2, 8, 32, 64\}$ ($4 \times 4 \times 4 = 64$).
+\end{itemize}
+Together, the Conv suite schedules $1504 + 80 + 64 = 1648$ total experiments.
+
+\begin{table}
+    \centering
+    \begin{tabular}{r|*{6}{c}|r}
+        \hline
+        \textbf{$C_{\text{in}} \setminus (H{=}W)$} & \textbf{32} & \textbf{64} & \textbf{128} &
+        \textbf{256} & \textbf{512} & \textbf{1024} & \textbf{Pairs} \\
+        \hline
+        1   & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & 6 \\
+        2   & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & 6 \\
+        4   & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & 6 \\
+        8   & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & 6 \\
+        16  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & --- & 5 \\
+        32  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & --- & 5 \\
+        64  & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & --- & --- & 4 \\
+        128 & $\bullet$ & $\bullet$ & $\bullet$ & $\bullet$ & --- & --- & 4 \\
+        256 & $\bullet$ & $\bullet$ & $\bullet$ & --- & --- & --- & 3 \\
+        512 & $\bullet$ & $\bullet$ & --- & --- & --- & --- & 2 \\
+        \hline
+        \textbf{Total} & 10 & 10 & 8 & 8 & 6 & 4 & \textbf{47} \\
+        \hline
+    \end{tabular}
+    \caption{Generic Conv measurement matrix. Rows denote input channel count ($C_{\text{in}}$) and columns denote square spatial image resolution ($H = W$). Each bullet ($\bullet$) represents a valid base $(C_{\text{in}}, \text{resolution})$ pair and expands to 32 experiments (8 output channels $\times$ 4 kernel/padding settings). Dashes (---) denote combinations intentionally skipped due to memory and architecture bounds. Together with 80 small-spatial and 64 pointwise pruning experiments, the Conv suite totals 1648 experiments.}
+    \label{tab:conv-matrix}
+\end{table}
+
+For a targeted experiment combining a high channel count with the largest
+spatial size still allowed for it, a good candidate is
+\texttt{Conv\_256\_128\_3\_1\_512.pt}: 256 input channels, a
+$128{\times}128$ feature map, a $3{\times}3$ kernel, padding 1, and 512
+output channels. If the goal is the maximum channel count instead,
+\texttt{Conv\_512\_64\_3\_1\_512.pt} is the highest-channel generic point
+in the default campaign; its spatial size is capped at 64 by design.
+
+Note that \texttt{all} covers the basic layer suites and LeNet; the ResNet
+suites are added explicitly, e.g.
+\texttt{--suite all,resnet18,resnet50}. On a Jetson-class board the full
+list above is a multi-day unattended run --- this is why the
+skip-on-\texttt{COMPLETE} behavior matters so much: the campaign can be
+interrupted, the board serviced, and the run resumed exactly where it
+stopped, even across days.
+
+During this work we ran the Linear, Conv, attention and rotary
+suites plus the LeNet and ResNet-18 decompositions on the Jetson Nano, the
+Raspberry~Pi~5 and the AGX Orin; the ResNet-50 suite and the batch-1
+ResNet-18 points on the Nano remain open (the Nano broke during the
+campaign, see Section \ref{sec:sum-of-parts}).
+
+\subsection{Manual fallback}
+
+If SSH is not an option, or you prefer recording with the TI graphical tool,
+you can still run the board side alone. \texttt{run\_manager.py} does the
+warm-up, calibration and bursts, then pauses and waits for you to start and
+stop the recording by hand (\texttt{--wait\_for\_acquisition}):
+
+\begin{lstlisting}
+python run_manager.py --backend cuda \
+  --model Models/CUDA/Linear/Linear_64_64.pt \
+  --batch-size 1 --wait_for_acquisition
+\end{lstlisting}
+
+The model filename encodes the shape: \texttt{Linear\_64\_64.pt} is a linear
+layer with 64 inputs and 64 outputs.
+
+\section{Processing the results}
+
+Raw CSV files are not meant to be read by hand. To turn them into
+per-measurement visualization plots and a consolidated summary CSV table with average power
+and energy for each model, run:
+
+\begin{lstlisting}
+MPLBACKEND=Agg python processing_report/process_and_visualize.py \
+  --data-dir measurements/runs/BOARD_LABEL \
+  --plot-dir measurements/Plot/BOARD_LABEL \
+  --summary-dir measurements/lookup_summaries/summaries \
+  --output-name BOARD_LABEL.csv
+\end{lstlisting}
+
+By default, the script reads all colocated CSV and JSON manifest pairs in \texttt{--data-dir}, generates per-measurement plot PDFs in \texttt{--plot-dir} (defaulting to \texttt{measurements/Plot/<data\_dir\_name>}), and writes the consolidated summary table directly into \texttt{measurements/}\allowbreak\texttt{lookup\_summaries/}\allowbreak\texttt{summaries/<BOARD\_LABEL>.csv}. The summary destination is controlled by \texttt{--summary-dir} (defaulting to \texttt{measurements/}\allowbreak\texttt{lookup\_summaries/}\allowbreak\texttt{summaries}) and \texttt{--output-name} (aliased as \texttt{--summary-name}, defaulting to \texttt{<data\_dir\_name>.csv}).
+
+Only finished experiments (\texttt{status: COMPLETE} in the manifest) are
+processed; incomplete ones are listed and skipped. For each burst, the
+script takes the samples inside the active region, subtracts the board's
+idle consumption (measured during the quiet window at the end of the
+recording), and integrates what is left over time. The result is the net
+energy of the layer itself, which is exactly the number you care about.
+
+Before any statistic is computed, the samples inside each active region are
+\emph{trimmed}. Raw bursts always contain a few samples that do not
+represent steady state: the first ones still carry the ramp-up of the
+workload, and the extreme power values are usually transient spikes or
+dips. For our campaigns we therefore discarded:
+
+\begin{itemize}
+    \item the \textbf{first 10\% of samples in time} inside each active
+    region (\texttt{--discard-initial-samples} with
+    \texttt{--initial-trim-percentage 10}), so the workload ramp-up never
+    enters the average;
+    \item the \textbf{lowest 10\% and highest 10\% of samples in power}
+    (\texttt{--tail-trim-percentage 10}), cutting both tails of the power
+    distribution and keeping only the steady-state plateau.
+\end{itemize}
+
+Trimming is applied per cycle, and only when the cycle ran long enough to
+afford it --- the processor skips it entirely below a minimum number of
+inferences (\texttt{--min-inferences-for-trimming}, 10 by default), where
+every sample is precious. The code's out-of-the-box defaults are more
+conservative (1\% tails, no initial discard unless the flag is passed), so
+to reproduce our processing exactly, say it on the command line:
+
+\begin{lstlisting}
+MPLBACKEND=Agg python processing_report/process_and_visualize.py \
+  --data-dir measurements/runs/BOARD_LABEL \
+  --plot-dir measurements/Plot/BOARD_LABEL \
+  --summary-dir measurements/lookup_summaries/summaries \
+  --output-name BOARD_LABEL.csv \
+  --discard-initial-samples --initial-trim-percentage 10 \
+  --tail-trim-percentage 10
+\end{lstlisting}
+
+If a burst looks noisy even after trimming,
+\texttt{--filter-after-discard} applies a Hampel filter (spike replacement
+based on a robust local standard deviation) followed by a short rolling
+mean --- use it sparingly, and remember that every cleaning choice is
+visible in the per-measurement PDFs the script produces, so always give
+them a look before trusting the summary.
+
+The last step produces the lookup table used by JouleGrad (chapter \ref{chapter:joulegrad}), starting from one or more processed summaries:
+
+\begin{lstlisting}
+python -m processing_report.build_energy_lookup_table \
+  measurements/lookup_summaries/summaries/BOARD_LABEL.csv \
+  --output measurements/lookup_summaries/BOARD_LABEL_energy_lookup.csv
+\end{lstlisting}
+
+\section{[Future
+work] Does the energy of a network equal the sum of its parts?}
+\label{sec:sum-of-parts}
+
+This section is, in a very literal sense, \textbf{the work to be done in
+the future}: what follows is not a finished result but the most important
+open question this project leaves behind, stated with all the evidence
+collected so far.
+
+All the measurements above target single operations in isolation. The hope
+behind the whole pipeline is that the energy of a full network is simply the
+sum of the energies of its layers --- if that were true, JouleGrad's
+lookup-table estimates would compose perfectly. We checked this directly
+with \texttt{processing\_report/summarize\_architecture.py} (run it with
+the \texttt{banera\_pt} conda environment from the repository root, no
+arguments needed): for each board, it compares the measured energy of the
+complete model against the sum of its standalone operations, weighted by
+how many times each operation is called.
+
+The answer is: \emph{almost, but not exactly} --- and how much ``not
+exactly'' depends on the board:
+
+\begin{itemize}
+    \item \textbf{LeNet on Raspberry~Pi~5} (batch 1): the complete model
+    costs $1.016$\,mJ per sample, but its 11 standalone operations sum to
+    only $0.771$\,mJ. The sum covers just $75.8\%$ of the composed model ---
+    about a quarter of the energy is unaccounted for.
+    \item \textbf{LeNet on Jetson Nano} (batch 1): complete $1.023$\,mJ
+    versus $0.959$\,mJ summed --- the sum covers $93.8\%$, a much smaller
+    gap.
+    \item \textbf{ResNet18 on Jetson Nano} (batch 8): complete
+    $49.6$\,mJ versus a comparable sum of $48.8$\,mJ --- coverage $98.3\%$.
+    One caveat: batch 1 is what actually matters, because the future use
+    cases (JouleGrad and JouleNAS) always estimate single-sample inference.
+    We could not test ResNet18 on the Nano at batch 1 because the board
+    broke during the campaign --- repeating this comparison at batch 1 on a
+    replacement board is part of the future work.
+    \item \textbf{ResNet18 on AGX Orin} (batch 1): the sign flips. The
+    complete model ($24.2$\,mJ) is \emph{cheaper} than the comparable
+    standalone sum ($25.3$\,mJ) --- coverage $104.5\%$.
+    \item \textbf{Late-stage finding --- ResNet-18 on Raspberry~Pi~5 (CIFAR-10, batch 1):} During the final cross-layer validation with JouleNAS, an interesting shift was discovered on CIFAR-10 ($32 \times 32$). Because all intermediate feature maps comfortably fit within the 2\,MB L3 cache of the Cortex-A76 cores, memory traffic to DRAM was eliminated; here the complete model consumed $28.38$\,mJ per inference, approximately $19.3\%$ \emph{less} than the standalone table sum ($35.15$\,mJ).
+\end{itemize}
+
+Our working \textbf{hypothesis} is that the gap is a \textbf{cache effect}. Measured
+standalone, each operation runs in a loop over its own tensors: weights and
+activations stay hot in the cache hierarchy, and the measured energy
+reflects mostly computation. Inside the full network, each layer receives
+its input from the previous one, and the working set of the whole model is
+larger than what the caches can hold --- data keep moving between cache
+levels and main memory, and that movement costs energy that standalone
+measurements never see. The Raspberry~Pi~5, with the smallest caches of the
+three boards, shows exactly the largest gap; the AGX Orin, with a much
+larger cache hierarchy, can instead exploit producer--consumer locality
+between consecutive layers and the composition turns favorable. This is a
+hypothesis supported by the sign and magnitude of the observed gaps --- it
+has not been verified directly (e.g. with hardware performance counters),
+and verifying it is part of the future work listed below.
+
+Keep the gap in mind when reading JouleGrad's estimates: they are built
+from standalone measurements, so on cache-poor boards they will
+underestimate the energy of a large composed network by an amount that, as
+the Pi~5 case shows, can reach $20$--$30\%$.
+
+\subsection{Open directions}
+
+This gap is the main open problem of the measurement layer. If you pick up
+the project from here, this is where your work matters most:
+
+\begin{itemize}
+    \item \textbf{Confirm the cache explanation.} Repeat the standalone
+    versus complete comparison while collecting cache-miss counters
+    (\texttt{perf} is available on all our Linux boards) and check whether
+    the gap correlates with last-level-cache misses. Batch size is a
+    natural knob: it changes the ratio between compute and data movement,
+    and the LeNet multi-batch rows in the script's output already show the
+    gap shrinking as the batch grows.
+    \item \textbf{Quantify the gap across boards and models.} Extend the
+    comparison to the remaining boards and to other architectures, so the
+    correction becomes a function of hardware and model size rather than a
+    handful of anecdotal numbers.
+    \item \textbf{Feed the correction back into the estimator.} If the gap
+    turns out to be systematic, JouleGrad's lookup-based estimates should
+    include a composition term --- even a simple per-board multiplicative
+    factor would already fix most of the error --- and JouleNAS searches
+    would then rank architectures by their true composed energy instead of
+    the sum of parts.
+\end{itemize}
+
+None of this blocks the current pipeline: on the two Jetson boards the gaps
+measured so far are within about $5\%$. But the Pi~5 case shows the error
+can grow quickly on cache-poor hardware, and closing it is what turns a
+good per-layer estimator into a trustworthy whole-network one.
+
+\section{Tests and troubleshooting}
+
+The \texttt{tests/} directory contains automated checks
+(\texttt{python -m pytest tests/}). One honest warning: those tests were
+generated with an LLM and have \emph{not} been fully verified against the
+current code, so treat a failing test as ``worth investigating'', not as
+proof that the measurement pipeline is broken.
+
+When something goes wrong, check the most common causes first:
+
+\begin{enumerate}
+    \item \textbf{Nothing is measured (flat line in the trace):} the board
+    is not powered through the INA226 shunt, or the PC is looking at the
+    wrong serial device. Re-check the wiring and pass \texttt{--port}
+    explicitly.
+    \item \textbf{The run fails immediately, before any measurement:} it is
+    almost always SSH. Run the \texttt{SSH\_OK} preflight from the
+    configuration section --- remember, the automation cannot type
+    passwords.
+    \item \textbf{Exit code \texttt{2}:} the model ran but the recording is
+    invalid. Open the manifest and look at \texttt{quality\_status} and the
+    clock-uncertainty fields; usually re-running with the same label is
+    enough.
+    \item \textbf{Bursts look too short in the trace:} this should not
+    happen with the default settings (validation exists exactly for this).
+    If you changed them, raise \texttt{--target\_burst\_seconds}.
+    \item \textbf{The board gets hot and the numbers drift:} give the board
+    more rest --- increase \texttt{--sleep\_time} or use
+    \texttt{--experiment-cooldown-seconds}. Keep in mind that energy
+    measurement is, to some extent, also temperature measurement.
+\end{enumerate}
+
+For the full protocol details and the complete CLI parameter reference
+(defaults, units, and whether each parameter ends up in the measured
+energy), see the long-form notes in the repository:
+\begin{itemize}
+    \item \texttt{docs\_new/adaptive\_burst\_measurement.md} --- protocol
+    and the parameter reference table (Section 9);
+    \item \texttt{docs\_new/experiment\_campaign.md} --- the campaign
+    matrix and launcher examples.
+\end{itemize}
+
+

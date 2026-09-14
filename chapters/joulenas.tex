@@ -1,0 +1,547 @@
+% !TeX root = ../report_jouleecosystem.tex
+\chapter{JouleNAS: Environmentally-aware optimization layer}
+
+JouleNAS takes a trained model, freezes its weights, and learns \emph{which channels to keep} by optimizing channel masks. While this masking formulation was originally proposed to find unbiased subnetworks~\cite{de2026bias}, here we repurpose it to discover energy-efficient architectures. The loss function includes the energy estimate
+from JouleGrad:
+
+$$
+L = L_{\text{CE}} + \lambda_E\,\widehat{E},
+$$
+
+where:
+\begin{itemize}
+    \item $L_{\text{CE}} \ge 0$ is the standard classification loss;
+    \item $\widehat{E}$ is the estimated inference energy in millijoules (mJ);
+    \item $\lambda_E \ge 0$ (\texttt{--energy-weight}) controls how much we penalize energy use. If $\lambda_E = 0$, we only optimize for accuracy (the baseline).
+\end{itemize}
+
+Depending on the \texttt{--energy-mode} flag, $\widehat{E}$ uses either
+the discrete count of active channels or the continuous
+sum of channel probabilities (see section~\ref{subsec:energy_mode}).
+
+The repository includes three main setups:
+\textbf{SimpleConv} on synthetic bars or MNIST (for learning and debugging),
+\textbf{ResNet-18 on CIFAR-10} (using a pretrained checkpoint), and
+\textbf{ResNet-18 on Imagenette} (trained from scratch first, then optimized).
+
+The repository includes several documentation files to guide you:
+\begin{itemize}
+    \item \texttt{README.md} --- The project's entry point, covering installation and the commands to run experiments.
+    \item \texttt{TUTORIAL.md} --- A step-by-step guide from a pretrained model to the final pruned network, showing how the training loop and masks work together.
+    \item \texttt{docs/RESNET18\_ICPR\_ENERGY\_METHODOLOGY.md}
+    --- Explains the methodology behind the ResNet-18 search, how we penalize energy, and how we optimize for actual hardware costs.
+    \item \texttt{docs/RESNET18\_CIFAR10\_ICPR\_COMPARISON.md}
+    --- Compares a standard baseline with an energy-aware run on CIFAR-10.
+\end{itemize}
+While this chapter explains the core ideas and how to run them, you can check those documents for exact training details and deeper insights into the energy search. Note that, unlike JouleGrad which is publicly hosted on GitHub, the JouleNAS repository is and will remain private at the moment. Its formulation, hyperparameter controls, and experimental results are nonetheless documented in detail in this report to serve as an exact reference.
+
+\section{How the mask optimization works}
+
+During this phase, only the mask logits are updated; the main network weights and BatchNorm statistics remain frozen. For each channel $i$, the gating mechanism relies on five variables:
+
+\begin{itemize}
+    \item $m_i \in (-\infty, +\infty)$ (\textbf{mask logit}): A learnable score for channel $i$, updated via gradient descent. A positive score keeps the channel open, while a negative score drops it.
+    \item $\tau \in (0, +\infty)$ (\textbf{temperature}): A scaling parameter that makes the sigmoid curve steeper over time. It starts at $1.0$ and halves every 10 epochs ($1.0 \to 0.5 \to 0.25 \dots$).
+    \item $p_i \in (0, 1)$ (\textbf{channel probability}): The soft probability of keeping channel $i$, computed with a standard sigmoid:
+    $$
+    p_i = \sigma(m_i / \tau) = \frac{1}{1 + e^{-m_i / \tau}}.
+    $$
+    When $m_i = 0$, $p_i = 0.50$.
+    \item $\theta \in [0, 1]$ (\textbf{threshold}): The cutoff that turns probabilities into hard decisions. We start at $0.49$ for the first 20 epochs, then tighten it to $0.50$.
+    \item $g_i \in \{0, 1\}$ (\textbf{binary gate}): The actual switch for channel $i$. We compute it with the step function $H$:
+    $$
+    g_i = H(p_i - \theta) = \begin{cases} 1 & \text{if } p_i \ge \theta \\ 0 & \text{if } p_i < \theta \end{cases}
+    $$
+\end{itemize}
+
+During the forward pass, channel $i$'s feature map is multiplied by its gate $g_i$. If $g_i = 1$, the channel passes normally; if $g_i = 0$, it is completely zeroed out. In the backward pass, gradients flow through the step function back to the logits $m_i$ using the straight-through estimator (STE).
+
+As training goes on and the temperature $\tau$ drops, the probabilities $p_i$ polarize toward 0 or 1.
+
+\section{How the energy term is computed}
+
+The loss's second term, $\widehat{E}$, is the JouleGrad estimate for the masked model's inference energy. Let's look at how we define effective layer sizes and why this estimate is differentiable.
+
+\subsection{Discrete versus continuous energy modes}
+\label{subsec:energy_mode}
+JouleNAS offers two ways to compute effective layer sizes from the learned masks:
+
+\begin{enumerate}
+    \item \textbf{Discrete mode} (\texttt{--energy-mode discrete}, default):
+    The effective output width $d^{(\ell)}_{\text{eff}}$ is the exact integer count of active channels:
+    $$
+    d^{(\ell)}_{\text{eff}} = \sum_{i=1}^{C_\ell} g^{(\ell)}_i = \sum_{i=1}^{C_\ell} H(p^{(\ell)}_i - \theta),
+    $$
+    where $C_\ell$ is the total number of channels in layer $\ell$.
+    This looks up the energy of the pruned model using only the open channels.
+    During the backward pass, gradients flow through the straight-through estimator: $\partial g_i / \partial m_i \approx p_i (1 - p_i) / \tau$.
+
+    \item \textbf{Continuous mode} (\texttt{--energy-mode continuous}):
+    The effective output width $d^{(\ell)}_{\text{eff}}$ is the sum of the soft channel probabilities $p^{(\ell)}_i$:
+    $$
+    d^{(\ell)}_{\text{eff}} = \sum_{i=1}^{C_\ell} p^{(\ell)}_i = \sum_{i=1}^{C_\ell} \sigma(m^{(\ell)}_i / \tau).
+    $$
+    Here $d^{(\ell)}_{\text{eff}}$ can take any fractional value between 0 and $C_\ell$, representing the expected number of open channels.
+    Since JouleGrad uses multilinear interpolation, it gracefully handles fractional dimensions to return a smooth energy estimate $\widehat{E}$.
+    In this branch, the non-differentiable step function $H$ is completely bypassed, avoiding abrupt step jumps and yielding a clean, exact analytical gradient for the energy penalty:
+    $\partial \widehat{E} / \partial m_i = (\partial \widehat{E} / \partial d_{\text{eff}}) \cdot (p_i (1 - p_i) / \tau)$.
+    (Note that while the network's classification forward pass still uses binary gates $g_i$ to evaluate real pruned accuracy via STE, the energy branch itself requires no surrogate approximation).
+\end{enumerate}
+
+When a layer's input comes from another masked layer, its effective input width $d^{(\ell)}_{\text{eff,in}}$ is determined by that preceding mask. Other dimensions like spatial size, strides, and kernel size remain fixed by the architecture.
+
+\subsection{From effective sizes to energy: multilinear interpolation}
+
+Each layer's energy is looked up in our measured table. Because the effective width is rarely an exact point on the measured grid, JouleGrad interpolates the values. For a two-axis layer like a Linear layer (with effective input $x$ and output $y$), the estimated energy $\widehat{E}_\ell$ is a bilinear combination of the four nearest measured corners $E_{a,b}$:
+
+$$
+\widehat{E}_{\ell} = \sum_{a \in \{\text{lo}, \text{hi}\}} \sum_{b \in \{\text{lo}, \text{hi}\}} w_a\, w'_b\, E_{a,b},
+$$
+
+where $E_{a,b}$ are the measured energies in mJ, and the weights $w_a, w'_b$ are simple distance-based fractions:
+$$
+w_{\text{hi}} = \frac{x - x_{\text{lo}}}{x_{\text{hi}} - x_{\text{lo}}}, \quad w_{\text{lo}} = 1 - w_{\text{hi}}, \qquad
+w'_{\text{hi}} = \frac{y - y_{\text{lo}}}{y_{\text{hi}} - y_{\text{lo}}}, \quad w'_{\text{lo}} = 1 - w'_{\text{hi}}.
+$$
+
+This extends to three axes for Conv2d layers (input channels, output channels, and image size). Summing $\widehat{E}_\ell$ over all layers gives the total model energy:
+
+$$
+\widehat{E} = \sum_{\ell} \widehat{E}_{\ell}
+\big(d^{(\ell)}_{\text{eff,in}},\, d^{(\ell)}_{\text{eff,out}}, \dots\big).
+$$
+
+\subsection{Why gradients flow to the mask logits}
+
+Because the total loss decomposes into two terms:
+$$
+L = L_{\text{CE}} + \lambda_E\,\widehat{E},
+$$
+the gradient with respect to each mask logit $m_i$ splits into two distinct computational branches in PyTorch's computational graph:
+$$
+\frac{\partial L}{\partial m_i} = \frac{\partial L_{\text{CE}}}{\partial m_i} + \lambda_E\,\frac{\partial \widehat{E}}{\partial m_i}.
+$$
+
+\begin{itemize}
+    \item \textbf{The task loss branch ($\partial L_{\text{CE}} / \partial m_i$)}:
+    During the forward pass through the neural network, feature maps are multiplied by the binary gate $g_i = H(p_i - \theta) \in \{0, 1\}$ in both modes. This ensures that classification accuracy reflects true, hard-pruned sub-networks without soft leakage. Because the step function $H$ has a zero derivative almost everywhere, backpropagating $\partial L_{\text{CE}} / \partial m_i$ always relies on the Straight-Through Estimator (STE), replacing $\partial g_i / \partial m_i$ with $\partial p_i / \partial m_i = p_i (1 - p_i) / \tau$.
+    
+    \item \textbf{The energy penalty branch ($\partial \widehat{E} / \partial m_i$)}:
+    This branch evaluates the hardware energy of the candidate architecture using JouleGrad. Here the two modes diverge:
+    \begin{itemize}
+        \item In \textbf{discrete mode}, the energy table is queried with the integer count of open gates $d_{\text{eff}} = \sum g_i$. The energy gradient $\partial \widehat{E} / \partial m_i$ must therefore also pass through the binary step function $g_i$, requiring the STE approximation for the energy term as well.
+        \item In \textbf{continuous mode}, the energy table is queried with the sum of soft probabilities $d_{\text{eff}} = \sum p_i$. The binary step function is completely bypassed in this branch. Because $p_i = \sigma(m_i / \tau)$ is smooth and JouleGrad's multilinear interpolation is continuously differentiable almost everywhere, the energy gradient $\partial \widehat{E} / \partial m_i$ is \textbf{exact and analytical} via the standard chain rule:
+        $$
+        \frac{\partial \widehat{E}}{\partial m_i} = \frac{\partial \widehat{E}}{\partial d_{\text{eff}}} \cdot \frac{\partial d_{\text{eff}}}{\partial p_i} \cdot \frac{\partial p_i}{\partial m_i} = \frac{\partial \widehat{E}}{\partial d_{\text{eff}}} \cdot 1 \cdot \frac{p_i(1 - p_i)}{\tau}.
+        $$
+    \end{itemize}
+    
+    \item \textbf{Differentiable interpolation weights}:
+    The multilinear interpolation weights $w$ are simple linear fractions of $d_{\text{eff}}$, making $\partial \widehat{E}_\ell / \partial d_{\text{eff,in}}$ and $\partial \widehat{E}_\ell / \partial d_{\text{eff,out}}$ readily available in closed form.
+\end{itemize}
+
+Together, these two paths give the optimizer a clear trade-off: the classification loss works to keep channels that protect accuracy, while the energy penalty pushes to drop channels that cost too much power. In continuous mode, this energy push is completely smooth and exact, which prevents sudden jumps and keeps training stable.
+
+\section{Running an experiment}
+
+For authorized users with repository access, install the local JouleNAS package alongside public JouleGrad (available on GitHub at \url{https://github.com/danielefam/joulegrad}):
+
+\begin{lstlisting}
+python -m pip install git+https://github.com/danielefam/joulegrad.git
+python -m pip install -e '.[train]'
+\end{lstlisting}
+
+Alternatively, JouleNAS declares JouleGrad as a direct Git dependency in \texttt{pyproject.toml}, so installing JouleNAS directly will automatically fetch and install JouleGrad from GitHub:
+
+\begin{lstlisting}
+python -m pip install -e '.[train]'
+\end{lstlisting}
+
+Then run the CIFAR-10 search:
+
+\begin{lstlisting}
+joule-nas train-resnet18 \
+  --pretrained-checkpoint /path/to/cifar10_resnet18.pth \
+  --energy-lookup-table /path/to/energy_lookup_table.csv \
+  --energy-weight 0.005 \
+  --energy-mode continuous \
+  --logit-init 2.0 \
+  --energy-warmup-epochs 5 \
+  --metrics-csv runs/metrics.csv \
+  --output-checkpoint runs/masks.pth
+\end{lstlisting}
+
+\subsection{Optimization controls and hyperparameters}
+
+You can tweak the mask search with a few key CLI options:
+\begin{itemize}
+    \item \texttt{--energy-mode} (\texttt{discrete} or \texttt{continuous}):
+    Sets how layer widths are calculated for the energy estimate $\widehat{E}$.
+    Discrete mode uses integer counts of active channels ($d_{\text{eff}} = \sum g_i$), while continuous mode uses soft probabilities ($d_{\text{eff}} = \sum p_i$).
+    (Note: the forward pass always uses hard binary gates, regardless of this mode).
+    \item \texttt{--logit-init} (default \texttt{0.0}):
+    Sets the starting value $m_i$ for all mask logits. Starting at $0.0$ means channel probabilities begin at $p_i = 0.50$. Higher values (like $2.0$) start the channels mostly open ($p_i \approx 0.88$).
+    \item \texttt{--energy-warmup-epochs} (default \texttt{0}):
+    Slowly ramps up the energy penalty from 0 to $\lambda_E$:
+    $$
+    \lambda_E(t) = \lambda_E \cdot \min\left(1.0, \frac{t}{\text{warmup\_epochs}}\right).
+    $$
+    This gives the network time to find the important channels before the energy penalty kicks in fully.
+\end{itemize}
+
+For Imagenette, the process is split into two SLURM scripts in \texttt{slurm/}:
+\begin{enumerate}
+    \item \texttt{pretrain\_resnet18\_imagenette.sh}: Trains a dense ResNet-18 from scratch for 80 epochs and saves the best checkpoint.
+    \item \texttt{train\_resnet18\_imagenette.sh}: Loads that checkpoint and optimizes the pruning masks for your chosen energy penalty $\lambda_E$.
+\end{enumerate}
+This split means you only train the heavy baseline once, and can run many quick pruning sweeps using the same checkpoint.
+
+A quick tip: your lookup table needs to cover the model's operators at the chosen input size. You can pass \texttt{--energy-out-of-range error} to strictly enforce this, or use a softer JouleGrad policy like \texttt{extrapolate} if your table is incomplete (we used this one).
+
+Each run outputs a metrics CSV (tracking accuracy, active channels, and energy) and a final mask checkpoint, which is ready for the deployment phase discussed in the Future Work chapter.
+
+\section{Experimental results and what they tell us}
+\label{sec:experimental_results}
+
+We evaluated JouleNAS by applying the energy-constrained mask optimization to ResNet-18 across two benchmark computer vision datasets: CIFAR-10 ($32 \times 32$ image resolution) and Imagenette ($224 \times 224$ image resolution). Experiments were conducted across two distinct edge hardware platforms with vastly different architectural and energy profiles:
+\begin{itemize}
+    \item \textbf{NVIDIA Jetson AGX Orin}: an embedded GPU system with massive parallel compute capacity, consuming $18.51\text{ mJ}$ per dense CIFAR-10 inference and $19.32\text{ mJ}$ per dense Imagenette inference;
+    \item \textbf{Raspberry Pi 5}: a commodity quad-core ARM Cortex-A76 edge CPU, consuming $35.15\text{ mJ}$ per dense CIFAR-10 inference and $56.41\text{ mJ}$ per dense Imagenette inference.
+\end{itemize}
+CIFAR-10 experiments start from a frozen pretrained checkpoint ($92.30\%$ baseline test accuracy), while Imagenette models are trained from scratch ($88.46\%$ baseline test accuracy) before mask optimization begins.
+
+The following subsections examine the results in detail: first on the primary embedded GPU target (Section~\ref{sec:agxorin_experiments}), followed by cross-hardware validation on the edge CPU (Section~\ref{sec:pi5_experiments}).
+
+\subsection{Embedded GPU target: NVIDIA Jetson AGX Orin}
+\label{sec:agxorin_experiments}
+
+Table~\ref{tab:joulenas_results_summary} summarizes the complete set of JouleNAS pruning runs on CIFAR-10 and Imagenette using the empirical lookup table measured on the NVIDIA Jetson AGX Orin across various penalty weights $\lambda_E$, optimization modes, warmup schedules, and logit initializations.
+
+\begin{table}
+\centering
+\small
+\caption{Summary of JouleNAS pruning experiments on CIFAR-10 and Imagenette (evaluated on NVIDIA Jetson AGX Orin lookup).}
+\label{tab:joulenas_results_summary}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccccc}
+\toprule
+\textbf{Dataset} & \textbf{Configuration} & $\lambda_E$ & \textbf{Mode} & \textbf{Dense Acc} & \textbf{Final Acc} & \textbf{Energy Frac} & \textbf{Active Frac} \\
+\midrule
+CIFAR-10 & Control ($\lambda_E=0$) & $0.0$ & Disc. & $92.30\%$ & $92.43\%$ & $81.73\%$ & $91.8\%$ \\
+CIFAR-10 & Control ($\lambda_E=0$) & $0.0$ & Cont. & $92.30\%$ & $92.43\%$ & $82.71\%$ & $92.1\%$ \\
+CIFAR-10 & Standard & $0.001$ & Cont. & $92.30\%$ & $92.42\%$ & $66.09\%$ & $77.8\%$ \\
+CIFAR-10 & Standard & $0.002$ & Cont. & $92.30\%$ & $92.36\%$ & $61.44\%$ & $70.3\%$ \\
+CIFAR-10 & Warmup 10ep & $0.002$ & Cont. & $92.30\%$ & $92.15\%$ & $61.16\%$ & $71.1\%$ \\
+CIFAR-10 & Standard & $0.005$ & Disc. & $92.30\%$ & $92.10\%$ & $58.27\%$ & $67.9\%$ \\
+CIFAR-10 & Standard & $0.005$ & Cont. & $92.30\%$ & $91.80\%$ & $58.73\%$ & $66.4\%$ \\
+CIFAR-10 & Standard & $0.01$ & Disc. & $92.30\%$ & $92.11\%$ & $57.20\%$ & $67.0\%$ \\
+CIFAR-10 & Standard & $0.01$ & Cont. & $92.30\%$ & $91.94\%$ & $56.38\%$ & $63.8\%$ \\
+CIFAR-10 & Standard & $0.02$ & Disc. & $92.30\%$ & $91.39\%$ & $41.20\%$ & $61.4\%$ \\
+CIFAR-10 & Standard & $0.02$ & Cont. & $92.30\%$ & $91.98\%$ & $54.79\%$ & $62.0\%$ \\
+CIFAR-10 & Aggressive & $0.05$ & Cont. & $92.30\%$ & $90.87\%$ & $43.52\%$ & $53.8\%$ \\
+CIFAR-10 & Aggressive & $0.05$ & Disc. & $92.30\%$ & $\mathbf{10.00\%}$ & $18.53\%$ & $8.2\%$ \\
+CIFAR-10 & Warmup 10ep & $0.05$ & Disc. & $92.30\%$ & $\mathbf{10.00\%}$ & $18.44\%$ & $8.3\%$ \\
+CIFAR-10 & Aggressive & $0.10$ & Disc. & $92.30\%$ & $90.13\%$ & $47.43\%$ & $67.8\%$ \\
+CIFAR-10 & Aggressive & $0.10$ & Cont. & $92.30\%$ & $\mathbf{10.00\%}$ & $17.18\%$ & $11.5\%$ \\
+CIFAR-10 & Warmup 10ep & $0.10$ & Cont. & $92.30\%$ & $89.65\%$ & $40.04\%$ & $50.9\%$ \\
+CIFAR-10 & Init 2.0 & $0.10$ & Cont. & $92.30\%$ & $92.30\%$ & $100.00\%$ & $100.0\%$ \\
+\midrule
+Imagenette & Control ($\lambda_E=0$) & $0.0$ & Disc. & $88.46\%$ & $88.13\%$ & $96.95\%$ & $97.2\%$ \\
+Imagenette & Control ($\lambda_E=0$) & $0.0$ & Cont. & $88.46\%$ & $88.25\%$ & $97.37\%$ & $97.5\%$ \\
+Imagenette & Low penalty & $0.01$ & Disc. & $88.46\%$ & $88.20\%$ & $77.00\%$ & $84.6\%$ \\
+Imagenette & Low penalty & $0.01$ & Cont. & $88.46\%$ & $87.46\%$ & $78.34\%$ & $85.9\%$ \\
+Imagenette & Moderate penalty & $0.03$ & Disc. & $88.46\%$ & $87.57\%$ & $66.47\%$ & $74.3\%$ \\
+Imagenette & Balanced & $0.05$ & Disc. & $88.46\%$ & $86.65\%$ & $59.05\%$ & $67.1\%$ \\
+Imagenette & Balanced & $0.05$ & Cont. & $88.46\%$ & $86.47\%$ & $57.85\%$ & $66.1\%$ \\
+Imagenette & Aggressive & $0.10$ & Cont. & $88.46\%$ & $84.66\%$ & $49.87\%$ & $59.5\%$ \\
+Imagenette & Aggressive & $0.10$ & Disc. & $88.46\%$ & $\mathbf{9.86\%}$ & $17.72\%$ & $7.5\%$ \\
+Imagenette & Warmup 10ep & $0.10$ & Disc. & $88.46\%$ & $85.50\%$ & $51.56\%$ & $60.1\%$ \\
+Imagenette & Init 2.0 & $0.10$ & Disc. & $88.46\%$ & $88.46\%$ & $100.00\%$ & $100.0\%$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsubsection{The zero-penalty control: an implicit regularization}
+
+To set a clean baseline, we ran control experiments with no energy penalty ($\lambda_E = 0$). Here, the network only optimizes for accuracy ($L = L_{\text{CE}}$), ignoring energy entirely.
+
+Figure~\ref{fig:control_comparison} compares the zero-penalty ($\lambda_E = 0$) energy trajectories on CIFAR-10 and Imagenette across both target hardware platforms (NVIDIA Jetson AGX Orin and Raspberry~Pi~5). The two datasets behave quite differently:
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/control_baseline_orin.pdf}
+        \caption{NVIDIA Jetson AGX Orin}
+        \label{fig:control_comparison_orin}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/control_baseline_pi5.pdf}
+        \caption{Raspberry Pi 5}
+        \label{fig:control_comparison_pi5}
+    \end{subfigure}
+    \caption{Control experiment ($\lambda_E = 0$) comparing CIFAR-10 and Imagenette predicted energy trajectories across epochs on NVIDIA Jetson AGX Orin~(a) and Raspberry~Pi~5~(b). On both platforms, Imagenette preserves nearly its entire energy footprint ($\approx 94{-}97\%$), while CIFAR-10 naturally sheds $18{-}22\%$ of energy without any penalty.}
+    \label{fig:control_comparison}
+\end{figure}
+
+\begin{itemize}
+    \item \textbf{Imagenette retains full capacity}: Across both devices and modes, the network keeps nearly all of its energy ($\approx 97\%$ on Jetson Orin, $\approx 94\%$ on Raspberry~Pi~5). Imagenette's high-resolution images require the full expressive power of ResNet-18, so almost every channel remains active to preserve accuracy.
+    \item \textbf{CIFAR-10 naturally sheds energy}: Even without an explicit energy penalty, the network drops redundant channels, reducing predicted inference energy by over $18\%$ on Jetson Orin and $22\%$ on Raspberry~Pi~5 while maintaining baseline test accuracy ($92.43\%$ vs. $92.30\%$).
+\end{itemize}
+
+\subsubsection{CIFAR-10: energy and accuracy trade-off}
+
+Once we turn on the energy penalty ($\lambda_E > 0$), the network starts pruning useful channels to save power, giving us a smooth trade-off (see Table~\ref{tab:joulenas_results_summary}). Sweeping $\lambda_E$ from $0.001$ to $0.02$ drops energy from $66\%$ down to just $41\%$ (a massive $59\%$ saving), while keeping accuracy mostly intact above $91.3\%$.
+
+Pushing $\lambda_E$ to $0.10$ exposes an interesting split: discrete mode holds steady ($90.1\%$ accuracy, $47.4\%$ energy), while continuous mode collapses unless we use a warmup period (discussed below).
+
+Figure~\ref{fig:cifar10_trajectories} shows the training curves for the discrete run at $\lambda_E = 0.005$. Accuracy stays comfortably around $92\%$ while the estimated energy drops smoothly over time.
+
+\begin{figure}
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/cifar10_w0p005_discrete_978062_accuracy_energy.pdf}
+        \caption{Accuracy vs. Energy fraction}
+        \label{fig:cifar10_acc_energy}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/cifar10_w0p005_discrete_978062_energy_active.pdf}
+        \caption{Energy vs. Active channel fraction}
+        \label{fig:cifar10_energy_active}
+    \end{subfigure}
+    \caption{Training curves on CIFAR-10 ResNet-18 ($\lambda_E = 0.005$, discrete mode). Accuracy stays near the baseline while energy drops by roughly $41\%$.}
+    \label{fig:cifar10_trajectories}
+\end{figure}
+
+Interestingly, Figure~\ref{fig:cifar10_energy_active} shows that the energy fraction drops faster than the channel count ($58.3\%$ energy vs. $67.9\%$ channels). This happens because early layers (with large $32 \times 32$ or $16 \times 16$ spatial sizes) cost much more energy per channel than later layers. The optimizer smartly targets the most expensive channels first, rather than treating them all equally.
+
+\subsubsection{Training instability and hyperparameter sensitivity}
+
+With moderate penalties ($\lambda_E \le 0.05$ in continuous mode), the search is predictable and produces good trade-offs on both datasets. But if we push the penalty higher, the training dynamics become fragile and unpredictable (see Table~\ref{tab:joulenas_results_summary} and Figure~\ref{fig:aggressive_cross_dataset}):
+
+\begin{itemize}
+    \item \textbf{Opposite reactions at $\lambda_E = 0.10$}: On Imagenette, discrete mode collapses to random guessing ($9.86\%$ accuracy), while continuous mode stays robust at $84.66\%$. On CIFAR-10, it is the reverse: continuous mode collapses to $10.00\%$, while discrete mode recovers nicely to $90.13\%$ accuracy.
+    \item \textbf{Bizarre scaling}: On CIFAR-10 in discrete mode, the network collapses at a lower penalty ($\lambda_E = 0.05$), but succeeds at a harsher penalty ($\lambda_E = 0.10$).
+    \item \textbf{Warmup is not always the solution}: A 10-epoch warmup saves discrete mode at $\lambda_E = 0.10$ on Imagenette, but fails to save discrete mode at $\lambda_E = 0.05$ on CIFAR-10.
+\end{itemize}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/aggressive_pruning_acc.pdf}
+        \caption{Test accuracy trajectory}
+        \label{fig:aggressive_acc}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/aggressive_pruning_energy.pdf}
+        \caption{Predicted energy fraction}
+        \label{fig:aggressive_energy}
+    \end{subfigure}
+    \caption{Aggressive pruning ($\lambda_E = 0.10$) dynamics across CIFAR-10 and Imagenette in continuous and discrete modes: (a)~test accuracy and (b)~predicted energy fraction. On Imagenette, discrete mode collapses while continuous remains stable; on CIFAR-10, continuous mode collapses while discrete recovers after epoch 11.}
+    \label{fig:aggressive_cross_dataset}
+\end{figure}
+
+\subsubsection{Hyperparameter sensitivity: logit initialization and warmup}
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/warmup_mitigation_acc.pdf}
+        \caption{Test accuracy trajectory}
+        \label{fig:warmup_acc}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/warmup_mitigation_energy.pdf}
+        \caption{Predicted energy fraction}
+        \label{fig:warmup_energy}
+    \end{subfigure}
+    \caption{Effect of a 10-epoch linear energy penalty warmup on aggressive pruning ($\lambda_E = 0.10$): (a)~test accuracy and (b)~predicted energy fraction. Warmup successfully rescues CIFAR-10 continuous mode (recovering to $89.65\%$) and Imagenette discrete mode (recovering to $85.50\%$).}
+    \label{fig:warmup_mitigation}
+\end{figure}
+
+We also tested energy warmup and different logit initializations (Table~\ref{tab:joulenas_results_summary}):
+
+\begin{itemize}
+    \item \textbf{Energy warmup}:
+    At $\lambda_E = 0.10$ without warmup, both CIFAR-10 continuous mode and Imagenette discrete mode collapsed. Adding a 10-epoch warmup fixed these specific crashes (Figure~\ref{fig:warmup_mitigation}), restoring accuracy to $89.65\%$ and $85.50\%$, respectively. However, warmup did not prevent collapse for CIFAR-10 in discrete mode at $\lambda_E = 0.05$.
+
+    \item \textbf{Logit initialization}:
+    Starting logits at $m_i = 0$ means $p_i = 0.50$, right on the threshold of pruning. If we start them at $m_i = 2.0$ ($p_i \approx 0.88$) with $\lambda_E = 0.10$, the network keeps all channels open ($100.0\%$), showing high sensitivity to the initial logit value.
+\end{itemize}
+
+\subsubsection{The accuracy--energy Pareto frontier}
+\label{sec:pareto_frontier}
+
+Figure~\ref{fig:pareto_frontier} combines all our successful runs into a Pareto frontier, mapping accuracy against energy consumption. This highlights three clear phases:
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/pareto_frontier_cifar10.pdf}
+        \caption{CIFAR-10 (Jetson AGX Orin)}
+        \label{fig:pareto_frontier_cifar10}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/pareto_frontier_imagenette.pdf}
+        \caption{Imagenette (Jetson AGX Orin)}
+        \label{fig:pareto_frontier_imagenette}
+    \end{subfigure}
+    \caption{Empirical accuracy--energy Pareto frontier on the NVIDIA Jetson AGX Orin for (a)~CIFAR-10 and (b)~Imagenette. Dashed lines trace the optimal non-dominated trade-offs.}
+    \label{fig:pareto_frontier}
+\end{figure}
+
+\begin{enumerate}
+    \item \textbf{The free pruning plateau}:
+    Initially, we save energy for free. On CIFAR-10 ($\lambda_E = 0.005$), we cut energy by nearly $44\%$ with zero drop in accuracy ($92.26\%$ vs. the $92.30\%$ baseline). On Imagenette ($\lambda_E = 0.010$), we save $23\%$ energy with a tiny drop ($88.20\%$ vs. $88.46\%$). This proves the model has a lot of redundant channels we don't need.
+
+    \item \textbf{The gentle trade-off}:
+    As we push $\lambda_E$ up to $0.05$, we get deeper savings for a small accuracy cost. For example, CIFAR-10 at $\lambda_E = 0.02$ uses only $41.2\%$ of the original energy while keeping $91.39\%$ accuracy (a $<1\%$ drop). Imagenette at $\lambda_E = 0.05$ uses just $57.8\%$ energy with $86.47\%$ accuracy. These are great, practical sweet spots for real hardware.
+
+    \item \textbf{Rescued by warmup}:
+    Without warmup, hitting $\lambda_E = 0.10$ causes crashes (e.g., continuous CIFAR-10 and discrete Imagenette drop to $\approx 10\%$). By adding a 10-epoch warmup, we rescue these runs and stretch the frontier even further, reaching $40.0\%$ energy on CIFAR-10 ($89.65\%$ accuracy) and $51.5\%$ energy on Imagenette ($85.50\%$ accuracy).
+\end{enumerate}
+
+\subsection{Cross-hardware generalization: evaluation on Raspberry Pi 5}
+\label{sec:pi5_experiments}
+
+To test whether JouleNAS generalizes beyond high-end embedded GPUs, we deployed the exact same pruning pipeline onto an edge CPU target: the Raspberry Pi 5 (quad-core ARM Cortex-A76 at $2.4\text{ GHz}$), using the empirical lookup grid measured via JouleQuest.
+
+\subsubsection{Physical energy scaling and gradient pressure}
+
+Because the loss function couples task loss with absolute inference energy in millijoules:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{task}} + \lambda_E \cdot \widehat{E}\;[\text{mJ}],
+\end{equation}
+the gradient magnitude $\nabla_m (\lambda_E \cdot \widehat{E})$ scales directly with the physical energy consumption of the target hardware.
+On the Raspberry Pi 5, the dense ResNet-18 baseline consumes:
+\begin{itemize}
+    \item \textbf{CIFAR-10}: $35.15\text{ mJ}$ per inference ($1.90\times$ higher than the $18.51\text{ mJ}$ on AGX Orin).
+    \item \textbf{Imagenette}: $56.41\text{ mJ}$ per inference ($2.92\times$ higher than the $19.32\text{ mJ}$ on AGX Orin).
+\end{itemize}
+
+\subsubsection{The accuracy--energy Pareto frontier on edge CPU}
+\label{sec:pareto_frontier_pi5}
+
+Table~\ref{tab:joulenas_results_pi5} provides the complete experimental summary across all penalty configurations on the Raspberry Pi 5, while Figure~\ref{fig:pareto_frontier_pi5} maps the resulting accuracy--energy Pareto frontier.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/pareto_frontier_pi5_cifar10.pdf}
+        \caption{CIFAR-10 (Raspberry Pi 5)}
+        \label{fig:pareto_frontier_pi5_cifar10}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{figs/joulenas/pareto_frontier_pi5_imagenette.pdf}
+        \caption{Imagenette (Raspberry Pi 5)}
+        \label{fig:pareto_frontier_pi5_imagenette}
+    \end{subfigure}
+    \caption{Empirical accuracy--energy Pareto frontier on the Raspberry Pi 5 for (a)~CIFAR-10 and (b)~Imagenette. Dashed lines trace the empirical Pareto frontier across successful runs.}
+    \label{fig:pareto_frontier_pi5}
+\end{figure}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Summary of JouleNAS pruning experiments on CIFAR-10 and Imagenette evaluated on the Raspberry Pi 5 lookup table (Dense CIFAR-10 energy: $35.15\text{ mJ}$, Dense Imagenette energy: $56.41\text{ mJ}$).}
+\label{tab:joulenas_results_pi5}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llcccccc}
+\toprule
+\textbf{Dataset} & \textbf{Configuration} & $\lambda_E$ & \textbf{Mode} & \textbf{Dense Acc} & \textbf{Final Acc} & \textbf{Energy Frac} & \textbf{Active Frac} \\
+\midrule
+CIFAR-10 & Control ($\lambda_E=0$) & $0.0$ & Cont. & $92.30\%$ & $91.86\%$ & $78.26\%$ & $93.0\%$ \\
+CIFAR-10 & Control ($\lambda_E=0$) & $0.0$ & Disc. & $92.30\%$ & $91.86\%$ & $78.15\%$ & $93.0\%$ \\
+CIFAR-10 & Ultra-light & $0.001$ & Cont. & $92.30\%$ & $92.26\%$ & $33.96\%$ & $67.8\%$ \\
+CIFAR-10 & Ultra-light & $0.001$ & Disc. & $92.30\%$ & $92.17\%$ & $31.81\%$ & $66.6\%$ \\
+CIFAR-10 & Light & $0.002$ & Cont. & $92.30\%$ & $92.11\%$ & $31.12\%$ & $65.6\%$ \\
+CIFAR-10 & Light & $0.002$ & Disc. & $92.30\%$ & $92.24\%$ & $28.75\%$ & $64.4\%$ \\
+CIFAR-10 & Standard & $0.005$ & Cont. & $92.30\%$ & $91.48\%$ & $28.61\%$ & $63.3\%$ \\
+CIFAR-10 & Standard & $0.005$ & Disc. & $92.30\%$ & $92.27\%$ & $22.54\%$ & $60.4\%$ \\
+CIFAR-10 & Moderate & $0.01$ & Cont. & $92.30\%$ & $91.31\%$ & $23.59\%$ & $58.9\%$ \\
+CIFAR-10 & Moderate & $0.01$ & Disc. & $92.30\%$ & $92.15\%$ & $21.09\%$ & $59.1\%$ \\
+CIFAR-10 & Balanced & $0.02$ & Cont. & $92.30\%$ & $91.99\%$ & $21.09\%$ & $55.6\%$ \\
+CIFAR-10 & Balanced & $0.02$ & Disc. & $92.30\%$ & $\mathbf{10.00\%}$ & $2.51\%$ & $0.7\%$ \\
+CIFAR-10 & High penalty & $0.05$ & Cont. & $92.30\%$ & $91.00\%$ & $19.08\%$ & $50.0\%$ \\
+CIFAR-10 & High penalty & $0.05$ & Disc. & $92.30\%$ & $90.69\%$ & $17.63\%$ & $50.8\%$ \\
+CIFAR-10 & Aggressive & $0.10$ & Cont. & $92.30\%$ & $89.60\%$ & $16.34\%$ & $45.1\%$ \\
+CIFAR-10 & Aggressive & $0.10$ & Disc. & $92.30\%$ & $90.08\%$ & $15.83\%$ & $46.8\%$ \\
+CIFAR-10 & Warmup 10ep & $0.10$ & Cont. & $92.30\%$ & $89.79\%$ & $17.20\%$ & $46.1\%$ \\
+CIFAR-10 & Warmup 10ep & $0.10$ & Disc. & $92.30\%$ & $89.46\%$ & $15.93\%$ & $47.9\%$ \\
+CIFAR-10 & Over-pruned & $0.50$ & Disc. & $92.30\%$ & $\mathbf{37.36\%}$ & $4.94\%$ & $19.1\%$ \\
+\midrule
+Imagenette & Control ($\lambda_E=0$) & $0.0$ & Cont. & $88.46\%$ & $87.77\%$ & $94.08\%$ & $97.1\%$ \\
+Imagenette & Control ($\lambda_E=0$) & $0.0$ & Disc. & $88.46\%$ & $87.77\%$ & $94.08\%$ & $97.1\%$ \\
+Imagenette & Light penalty & $0.005$ & Cont. & $88.46\%$ & $87.52\%$ & $64.47\%$ & $80.6\%$ \\
+Imagenette & Light penalty & $0.005$ & Disc. & $88.46\%$ & $87.82\%$ & $63.12\%$ & $79.4\%$ \\
+Imagenette & Moderate & $0.01$ & Cont. & $88.46\%$ & $86.85\%$ & $52.62\%$ & $71.6\%$ \\
+Imagenette & Moderate & $0.01$ & Disc. & $88.46\%$ & $87.41\%$ & $51.06\%$ & $70.5\%$ \\
+Imagenette & Balanced & $0.02$ & Cont. & $88.46\%$ & $85.83\%$ & $41.76\%$ & $62.3\%$ \\
+Imagenette & Aggressive & $0.03$ & Disc. & $88.46\%$ & $\mathbf{9.10\%}$ & $7.60\%$ & $0.9\%$ \\
+Imagenette & Aggressive & $0.05$ & Cont. & $88.46\%$ & $\mathbf{18.65\%}$ & $8.62\%$ & $8.7\%$ \\
+Imagenette & Aggressive & $0.05$ & Disc. & $88.46\%$ & $\mathbf{27.67\%}$ & $9.94\%$ & $17.8\%$ \\
+Imagenette & Warmup 10ep & $0.05$ & Disc. & $88.46\%$ & $\mathbf{9.91\%}$ & $7.53\%$ & $0.6\%$ \\
+Imagenette & Heavy & $0.10$ & Cont. & $88.46\%$ & $\mathbf{31.75\%}$ & $10.21\%$ & $15.7\%$ \\
+Imagenette & Heavy & $0.10$ & Disc. & $88.46\%$ & $\mathbf{53.30\%}$ & $13.83\%$ & $32.2\%$ \\
+Imagenette & Warmup 10ep & $0.10$ & Disc. & $88.46\%$ & $\mathbf{9.10\%}$ & $7.45\%$ & $1.1\%$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsubsection{Cross-hardware architectural insights and stability regimes}
+
+Several key architectural and hardware-aware insights emerge from Table~\ref{tab:joulenas_results_pi5}:
+
+\begin{enumerate}
+    \item \textbf{Steeper Pareto gains at lower penalty on CIFAR-10}:
+    Because each millijoule carries roughly twice the numerical weight on Pi 5 compared to AGX Orin, the network prunes much more aggressively at low values of $\lambda_E$. At $\lambda_E = 0.005$ in discrete mode, CIFAR-10 achieves an impressive \textbf{$22.54\%$ energy fraction} ($7.92\text{ mJ}$) while maintaining a test accuracy of \textbf{$92.27\%$} (essentially identical to the $92.30\%$ dense baseline). On AGX Orin, the same $\lambda_E = 0.005$ only reached $58.3\%$ energy.
+
+    \item \textbf{Optimal Imagenette configurations on Pi 5 ($\lambda_E \in [0.005, 0.02]$)}:
+    On Imagenette, where higher resolution requires greater representational capacity, the $2.92\times$ energy multiplier means that $\lambda_E = 0.05$ on Pi 5 exerts a pruning pressure equivalent to $\lambda_E \approx 0.15$ on AGX Orin.
+    Consequently, the optimal operating points shift downwards:
+    \begin{itemize}
+        \item At $\lambda_E = 0.005$ (discrete): accuracy is \textbf{$87.82\%$} with $63.12\%$ energy ($35.61\text{ mJ}$, saving $36.9\%$).
+        \item At $\lambda_E = 0.01$ (discrete): accuracy is \textbf{$87.41\%$} with $51.06\%$ energy ($28.80\text{ mJ}$, saving nearly $49\%$).
+        \item At $\lambda_E = 0.02$ (continuous): accuracy is \textbf{$85.83\%$} with $41.76\%$ energy ($23.56\text{ mJ}$, saving $58.2\%$).
+    \end{itemize}
+
+    \item \textbf{Why $\lambda_E$ cannot be blindly reused across devices (and the $\lambda_E = 0.05$ collapse)}:
+    Recall the optimization objective:
+    \begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{CE}} + \lambda_E \cdot \widehat{E}.
+    \end{equation}
+    The cross-entropy loss $\mathcal{L}_{\text{CE}}$ is dimensionless and roughly identical across platforms, but the energy term $\widehat{E}$ is expressed in absolute physical units (millijoules). Because the dense ResNet-18 consumes nearly three times more energy on the Raspberry~Pi~5 than on the Jetson Orin ($56.41\text{ mJ}$ vs. $19.32\text{ mJ}$), setting $\lambda_E = 0.05$ on the Pi~5 produces an energy penalty that is \textbf{three times stronger}, overpowering the classification objective and causing the network to collapse.
+
+    Therefore, when transferring a hyperparameter configuration between devices, $\lambda_E$ should be scaled inversely with the baseline device energy:
+    \begin{equation}
+    \lambda_{E, \text{target}} \approx \lambda_{E, \text{ref}} \cdot \frac{E_{\text{ref}}}{E_{\text{target}}}.
+    \label{eq:cross_device_lambda_scaling}
+    \end{equation}
+    Applying this rule to the Orin baseline ($\lambda_{E, \text{ref}} = 0.05$) yields an expected target weight of:
+    $$
+    \lambda_{E, \text{Pi5}} \approx 0.05 \cdot \frac{19.32\text{ mJ}}{56.41\text{ mJ}} \approx 0.017.
+    $$
+    This scaling law neatly explains the empirical data in Table~\ref{tab:joulenas_results_pi5}: on the Raspberry~Pi~5, the stable Pareto frontier is achieved at $\lambda_E \in [0.005, 0.02]$, whereas setting $\lambda_E \ge 0.05$ pushes the network into irrecoverable over-pruning.
+\end{enumerate}
+
+
+

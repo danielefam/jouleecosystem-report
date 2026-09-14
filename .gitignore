@@ -1,0 +1,35 @@
+# LaTeX auxiliary and build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.lof
+*.lot
+*.out
+*.toc
+*.synctex.gz
+*.synctex(busy)
+*.bcf
+*.run.xml
+*.nav
+*.snm
+*.vrb
+
+# Generated Inkscape SVG cache (created during pdflatex -shell-escape)
+svg-inkscape/
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+
+# OS and editor temporary files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+# Private local files
+chapters/acknow.tex
+
+figs/
