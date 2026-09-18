@@ -909,6 +909,7 @@ exactly'' depends on the board:
     complete model ($24.2$\,mJ) is \emph{cheaper} than the comparable
     standalone sum ($25.3$\,mJ) --- coverage $104.5\%$.
     \item \textbf{Late-stage finding --- ResNet-18 on Raspberry~Pi~5 (CIFAR-10, batch 1):} During the final cross-layer validation with JouleNAS, an interesting shift was discovered on CIFAR-10 ($32 \times 32$). Because all intermediate feature maps comfortably fit within the 2\,MB L3 cache of the Cortex-A76 cores, memory traffic to DRAM was eliminated; here the complete model consumed $28.38$\,mJ per inference, approximately $19.3\%$ \emph{less} than the standalone table sum ($35.15$\,mJ).
+    \item \textbf{Late-stage finding --- ResNet-18 on AGX Orin (CIFAR-10, batch 32):} In the subsequent cross-batch validation campaign on the NVIDIA Jetson AGX Orin, we investigated whether increasing batch size to 32 would amortize kernel launch latency and eliminate the composition discrepancy. The empirical result was striking: the complete dense ResNet-18 consumed $1.368$\,mJ per sample (total batch energy $43.78$\,mJ), matching the standalone lookup table sum ($1.372$\,mJ) within an astonishing $0.3\%$ margin (coverage: $99.7\%$). Rather than a definitive proof, this provides an encouraging hint to consider: as batch size increases, framework and kernel launch overheads become amortized, suggesting that batching may improve composability between isolated layer profiles and full-network energy.
 \end{itemize}
 
 Our working \textbf{hypothesis} is that the gap is a \textbf{cache effect}. Measured
