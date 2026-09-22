@@ -546,6 +546,9 @@ Several key architectural and hardware-aware insights emerge from Table~\ref{tab
 \subsection{Amortizing GPU execution overhead: ResNet-18 pruning at batch size 32}
 \label{sec:agxorin_bs32_experiments}
 
+\noindent\textit{[Note: This subsection was written by the AI assistant to document and analyze the batch-32 scaling experiments and Pareto optimization results on NVIDIA Jetson AGX Orin. The content has not been revised.]}
+\vspace{0.5em}
+
 Throughout the previous sections, all measurements and pruning searches operated under a single-inference constraint ($\text{batch size} = 1$). While batch~1 reflects hard real-time edge robotics scenarios where inputs arrive sequentially without latency tolerance, modern embedded accelerators such as the NVIDIA Jetson AGX Orin possess massive parallel compute capabilities (2048 Ampere CUDA cores) that remain severely underutilized when processing individual $32 \times 32$ images.
 
 \subsubsection{Theoretical motivation: static launch latency vs. compute-bound pruning}

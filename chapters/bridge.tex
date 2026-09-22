@@ -29,57 +29,49 @@ Both checkpoints offer substantial predicted energy reductions well above physic
 
 \subsection{Reconstructing the hardware-specific pruned architectures}
 
-Using the per-layer pruning logs exported by JouleNAS, we reconstructed the materialized models inside JouleQuest:
-\begin{itemize}
-    \item \texttt{PrunedOrinCifarResNet18} (NVIDIA Jetson AGX Orin):
-    \begin{itemize}
-        \item \textbf{Stem}: $3 \to 64$.
-        \item \textbf{Stage 1}: Block 1.0 is dense ($64 \to 64 \to 64$), Block 1.1 prunes its mid-convolution to 58 ($64 \to 58 \to 64$).
-        \item \textbf{Stage 2}: Block 2.0 uses $64 \to 128 \to 127$ (shortcut $64 \to 127$); Block 2.1 uses $127 \to 128 \to 127$.
-        \item \textbf{Stage 3}: Block 3.0 uses $127 \to 253 \to 249$ (shortcut $127 \to 249$); Block 3.1 uses $249 \to 192 \to 236$.
-        \item \textbf{Stage 4}: Block 4.0 uses $236 \to 381 \to 222$ (shortcut $236 \to 222$); Block 4.1 prunes its internal layer down to 16 channels ($222 \to 16 \to 297$).
-        \item \textbf{Classifier}: Linear $297 \to 10$.
-    \end{itemize}
-    \item \texttt{PrunedPi5CifarResNet18} (Raspberry Pi 5):
-    \begin{itemize}
-        \item \textbf{Stem}: $3 \to 64$.
-        \item \textbf{Stage 1}: Both Block 1.0 and Block 1.1 remain dense at 64 channels ($64 \to 64 \to 64$).
-        \item \textbf{Stage 2}: Block 2.0 uses $64 \to 127 \to 128$ (shortcut $64 \to 128$); Block 2.1 uses $128 \to 127 \to 128$.
-        \item \textbf{Stage 3}: Block 3.0 uses $128 \to 248 \to 231$ (shortcut $128 \to 231$); Block 3.1 uses $231 \to 139 \to 238$.
-        \item \textbf{Stage 4}: Block 4.0 uses $238 \to 127 \to 248$ (shortcut $238 \to 248$); Block 4.1 uses $248 \to 64 \to 258$.
-        \item \textbf{Classifier}: Linear $258 \to 10$.
-    \end{itemize}
-\end{itemize}
+In earlier iterations, pruned architectures were manually transcribed into static Python subclasses inside \texttt{layers/resnet.py} (such as \texttt{PrunedOrin\-Cifar\-ResNet18} and \texttt{PrunedPi5\-Cifar\-ResNet18}). While suitable for initial proofs-of-concept, this approach risked configuration drift between the controller, the remote measurement runner, and the comparison scripts.
+
+To establish a single source of truth, JouleQuest was updated with a canonical, \textbf{spec-driven architecture pipeline} (\texttt{layers/pruned\_resnet.py}):
+\begin{enumerate}
+    \item \textbf{Single source of truth}: The per-layer JouleNAS pruning JSON log serves as the sole input. The class \texttt{PrunedResNet18Spec.from\_pruning\_log} parses the log, validates tensor shapes, and propagates spatial resolutions.
+    \item \textbf{Deterministic architecture identity}: From the validated configuration, the spec generates a canonical JSON representation and hashes it into a deterministic SHA-256 identifier (\texttt{architecture\_id}). This ID is embedded into measurement manifests, log files, and processed summary CSVs.
+    \item \textbf{Cross-host deployment without filesystem coupling}: When launching remote experiments over SSH, the compact canonical JSON payload is passed directly via command-line arguments (\texttt{--pruned-config-json}), allowing the remote runner to instantiate the model dynamically (\texttt{PrunedResNet18\_32\_10.pt}) without requiring matching repository or log paths on controller and target boards.
+    \item \textbf{Backwards compatibility}: The tool \texttt{materialize\_pruned\_model.py} is retained strictly for offline inspection and verification (the former \texttt{--update-resnet} option was deprecated and removed), and historical named model classes are preserved as compatibility aliases.
+\end{enumerate}
 
 \subsection{Handling residual shortcuts and BatchNorm}
 
-Reconstructing a residual architecture with variable layer sizes requires two practical adjustments:
+Mapping an irregularly pruned residual architecture onto hardware requires careful attention to topology and unmodelled operations:
 \begin{enumerate}
-    \item \textbf{Residual shortcut alignment}: In standard ResNet, identity shortcuts simply pass inputs forward when stride is 1. But when a block's input channels do not equal its output channels (such as Block 3.1 and Block 4.1 on both platforms), an element-wise addition would encounter mismatched shapes. In our reconstructed blocks, the shortcut automatically applies a $1 \times 1$ convolution to match channel dimensions seamlessly.
-    \item \textbf{BatchNorm adjustments}: Each BatchNorm layer is sized to match the exact active channels of its preceding convolution. While the JouleNAS energy estimate did not include BatchNorm or residual additions in its 21-term lookup, the convolutional and linear layers account for the vast majority of computation.
+    \item \textbf{Topological fidelity of shortcuts}: In standard ResNet architectures, identity shortcuts simply pass features forward when spatial stride is 1. If an internal residual block changes channel counts without an explicit downsampling layer, inserting a new $1 \times 1$ convolution would introduce operations that were never modelled during the JouleNAS search, distorting the energy comparison. In our spec-driven runner:
+    \begin{itemize}
+        \item Learned $1 \times 1$ projection convolutions are instantiated \textbf{only} when a \texttt{downsample.0} layer is explicitly present in the pruning log (e.g., at stage downsampling transitions `layer2.0`, `layer3.0`, and `layer4.0`).
+        \item For blocks with mismatched channel counts but no logged downsampler, the identity shortcut cleanly slices excess channels or appends zero-padding (\texttt{\_identity\_}\allowbreak\texttt{shortcut} in \texttt{layers/resnet.py}), ensuring exact structural fidelity with the search model.
+    \end{itemize}
+    \item \textbf{BatchNorm and residual additions}: Each BatchNorm layer matches the active channels of its preceding convolution. While BatchNorm, activations (ReLU), pooling, and element-wise additions are not part of the isolated 21-term Conv/Linear lookup, their cumulative energy is explicitly isolated in the validation report.
 \end{enumerate}
 
 \subsection{Automated testing and validation in JouleQuest}
 
-To make physical testing straightforward and repeatable, we provided dedicated validation suites in JouleQuest's campaign launcher (\texttt{run\_measurement\_campaign.sh}):
-\begin{itemize}
-    \item For Jetson AGX Orin:
+To evaluate pruned architectures systematically on physical hardware, JouleQuest provides the unified \texttt{pruned\_resnet18} suite in \texttt{run\_measurement\_campaign.sh}. Rather than relying on static class declarations or manual file edits, this suite takes any JouleNAS pruning JSON log as input and dynamically schedules a complete hardware verification campaign:
 \begin{lstlisting}
-./run_measurement_campaign.sh --board agx_orin --suite pruned_validation_orin
-\end{lstlisting}
-    \item For Raspberry Pi 5:
-\begin{lstlisting}
-CPU_THREADS=4 BACKEND=cpu SLEEP_TIME=10 ./run_measurement_campaign.sh --board pi5_4threads --suite pruned_validation_pi5
-\end{lstlisting}
-\end{itemize}
+PRUNING_LOG="measurements/pruning_logs/resnet18_..._pruning.json"
 
-Each suite schedules exactly two targeted experiments:
+BACKEND=cuda NETWORK_BATCH_SIZE=32 \
+./run_measurement_campaign.sh \
+  --board agx_orin_bs32 \
+  --suite pruned_resnet18 \
+  --pruning-log "$PRUNING_LOG"
+\end{lstlisting}
+Adding \texttt{--dry-run} inspects the scheduled experiment matrix and verification plan without powering the board or executing inferences.
+
+For each target architecture, the \texttt{pruned\_resnet18} suite automatically orchestrates:
 \begin{enumerate}
-    \item The dense CIFAR-10 ResNet-18 baseline (\texttt{ResNet18\_32\_10.pt});
-    \item The hardware-specific materialized pruned model (\texttt{PrunedOrinResNet18\_32\_10.pt} or \texttt{PrunedPi5ResNet18\_32\_10.pt}).
+    \item The unpruned dense baseline model (\texttt{ResNet18\_32\_10.pt});
+    \item The complete materialized pruned model (\texttt{PrunedResNet18\_32\_10.pt}), built dynamically from the canonical specification;
+    \item All constituent standalone \texttt{Conv2d} and \texttt{Linear} operations corresponding to the active shapes of the pruned network (e.g., 21 unique component shapes for our example log), all profiled at the specified batch size and linked to the same \texttt{architecture\_id}.
 \end{enumerate}
-
-Additionally, the comparison tool \texttt{validate\_pruned\_measurements.py} automatically matches the physical INA226 measurements against the JouleNAS predictions, quantifying the measured energy reduction and the composition discrepancy.
+(The earlier suites, \texttt{pruned\_}\allowbreak\texttt{validation\_}\allowbreak\texttt{orin} and \texttt{pruned\_}\allowbreak\texttt{validation\_}\allowbreak\texttt{pi5}, are preserved as legacy convenience aliases).
 
 Physical testing on the Raspberry~Pi~5 revealed two key operational parameters for CPU-based embedded devices:
 \begin{itemize}
@@ -93,17 +85,41 @@ Under these stabilized, 4-thread conditions:
     \item Physical measurements showed a \textbf{60.08\% real-world energy reduction} on physical hardware (compared to the $77.46\%$ theoretical prediction), with only a negligible $0.04\%$ loss in test accuracy ($92.27\%$ vs $92.31\%$).
 \end{itemize}
 
+Once physical acquisition finishes and raw sensor traces are processed into summaries, the comparison tool \texttt{validate\_}\allowbreak\texttt{pruned\_}\allowbreak\texttt{measurements.py} evaluates the empirical results:
+\begin{lstlisting}
+python processing_report/validate_pruned_measurements.py \
+  --board agx_orin_bs32 \
+  --batch-size 32 \
+  --summary-csv measurements/lookup_summaries/summaries/agx_orin_bs32.csv \
+  --pruning-log "$PRUNING_LOG" \
+  --composition-only
+\end{lstlisting}
+This tool formally decomposes and tests the composability equation:
+\begin{equation}
+    E_{\text{estimator}} = \sum_i n_i E_{\text{Conv2d}, i} + E_{\text{Linear}}
+\end{equation}
+\begin{equation}
+    E_{\text{residual}} = E_{\text{whole}} - E_{\text{estimator}}
+\end{equation}
+Here, $E_{\text{residual}}$ explicitly isolates the physical energy attributable to BatchNorm, activations (ReLU), pooling, residual addition, memory transfers, CUDA launch costs, and system baseline power. Crucially, by separating $E_{\text{estimator}}$ from $E_{\text{residual}}$, the tool distinguishes between model composition fidelity and the physical overhead of unmodelled components, rather than conflating residual execution with measurement error.
+
 \subsection{Physical hardware validation on NVIDIA Jetson AGX Orin (batch size 32)}
 \label{sec:bridge_agxorin_bs32_validation}
 
-\noindent\textit{[Note: This subsection was written by the AI assistant to document and analyze the experimental validation results on NVIDIA Jetson AGX Orin at batch size 32.]}
+\noindent\textit{[Note: This subsection was written by the AI assistant to document and analyze the experimental validation results on NVIDIA Jetson AGX Orin at batch size 32. The content has not been revised.]}
 \vspace{0.5em}
 
-To close the loop on the embedded GPU target and explore batch scaling behavior on physical silicon, we deployed the materialized \texttt{PrunedOrinBs32ResNet18} (derived from the optimal $\lambda_E = 1.20$ checkpoint) alongside the dense baseline on the physical NVIDIA Jetson AGX Orin at batch size 32. Measurements were orchestrated using JouleQuest's dedicated validation pipeline:
+To close the loop on the embedded GPU target and explore batch scaling behavior on physical silicon, we deployed the materialized \texttt{PrunedOrinBs32ResNet18} (derived from the optimal $\lambda_E = 1.20$ checkpoint) alongside the dense baseline on the physical NVIDIA Jetson AGX Orin at batch size 32. While earlier testing used a temporary script (\texttt{validate\_agx\_orin\_bs32.sh}), that dedicated wrapper was deprecated and removed in favor of the general campaign launcher:
 \begin{lstlisting}
-./validate_agx_orin_bs32.sh
-# or equivalently via the campaign orchestrator:
-NETWORK_BATCH_SIZE=32 ./run_measurement_campaign.sh --board agx_orin_bs32 --suite pruned_validation_orin_bs32
+BACKEND=cuda NETWORK_BATCH_SIZE=32 \
+./run_measurement_campaign.sh \
+  --board agx_orin_bs32 \
+  --suite pruned_resnet18 \
+  --pruning-log "$PRUNING_LOG"
+# or equivalently via the legacy compatibility alias:
+NETWORK_BATCH_SIZE=32 ./run_measurement_campaign.sh \
+  --board agx_orin_bs32 \
+  --suite pruned_validation_orin_bs32
 \end{lstlisting}
 
 Physical power and energy traces recorded via the INA226 sensor yielded the following results:
@@ -117,7 +133,7 @@ Physical power and energy traces recorded via the INA226 sensor yielded the foll
 While JouleNAS predicted a theoretical energy reduction of $34.58\%$ ($0.898$\,mJ), physical hardware measurements yielded $19.95\%$ ($1.095$\,mJ), reflecting a composition discrepancy of $+22.0\%$ on the pruned architecture. Several hardware factors explain this residual difference on embedded GPU architectures:
 \begin{enumerate}
     \item \textbf{Unaligned warp execution and Tensor Core tiling}: Deep structured pruning reduces channels to non-standard widths (such as $58, 127, 249, 236, 222$). Because modern NVIDIA Ampere architectures optimize GEMM routines for channel dimensions that are multiples of 32 or 64, irregular filter counts cause partial warp execution and lower compute efficiency per SM.
-    \item \textbf{Residual additions and BatchNorm}: Reconstructing the residual topology requires additional $1 \times 1$ projection convolutions on shortcuts where channel dimensions mismatch, as well as BatchNorm layers whose costs were not accounted for in the isolated 21-term convolutional lookup.
+    \item \textbf{Residual additions, shortcut alignment, and BatchNorm}: While our spec-driven runner avoids inserting artificial $1 \times 1$ convolutions on identity shortcuts (using slicing and zero-padding), the physical network still executes real element-wise additions, BatchNorm, and pooling layers whose costs are part of $E_{\text{residual}}$ rather than the 21-term Conv2d/Linear lookup.
     \item \textbf{Static platform power floor}: Even during active computation, the Jetson AGX Orin baseline SoC components (memory controllers, CPU host interface, and PCIe peripherals) maintain a baseline idle power floor of $\approx 2.1$\,W, which dampens proportional energy reductions when execution time drops.
 \end{enumerate}
 Despite these low-level GPU realities, a physical energy reduction of $20\%$ accompanied by a $2.28$\,W drop in power dissipation provides an encouraging practical hint that JouleNAS can produce hardware-pruned networks that save substantial energy on real edge devices.

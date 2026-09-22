@@ -24,6 +24,10 @@ The official documentation in the repository contains the full details. The \tex
     \item \texttt{terminal\_acquisition\_full\_report.md} --- provides detailed internal
     documentation on the terminal acquisition architecture, setup prerequisites,
     and sequence of steps for unattended or headless measurement campaigns.
+    \item \texttt{pruned\_resnet\_}\allowbreak\texttt{measurement.md} --- documents the spec-driven
+    workflow for pruned ResNet-18 composition measurements, detailing how a
+    single JouleNAS pruning log drives dynamic model construction, component
+    layer scheduling, deterministic architecture hashing, and physical validation.
 \end{itemize}
 This chapter summarizes the full workflow and adds the context that only
 makes sense when the measurement protocol and the data processing are
@@ -632,9 +636,9 @@ are listed below (see Table~\ref{tab:campaign-suite-counts} for the full composi
     analysis of Section \ref{sec:sum-of-parts};
     \item \textbf{resnet18} (30 experiments): the complete ResNet-18 plus
     one experiment for each distinct operation shape in it (convolutions,
-    BatchNorm, residual adds, pooling, the final Linear);
     \item \textbf{resnet50} (54 experiments): the same decomposition for
-    the bottleneck-based ResNet-50.
+    the bottleneck-based ResNet-50;
+    \item \textbf{pruned\_resnet18} (dynamic count, e.g. 23 experiments): a spec-driven validation suite that schedules the dense baseline, the runtime-configured pruned ResNet-18 instantiated from a JouleNAS pruning JSON log, and all its constituent \texttt{Conv2d} and \texttt{Linear} operations for physical composability verification (detailed in Chapter~\ref{sec:joulenas_to_joulequest}).
 \end{itemize}
 
 \begin{table}
