@@ -1,5 +1,6 @@
 % !TeX root = ../report_jouleecosystem.tex
 \chapter{The Bridge: from measurements to decisions}
+\label{chap:bridge}
 
 While the three repositories are independent, this short chapter shows how they work together end-to-end and how data flows between them.
 
@@ -31,12 +32,12 @@ Both checkpoints offer substantial predicted energy reductions well above physic
 
 In earlier iterations, pruned architectures were manually transcribed into static Python subclasses inside \texttt{layers/resnet.py} (such as \texttt{PrunedOrin\-Cifar\-ResNet18} and \texttt{PrunedPi5\-Cifar\-ResNet18}). While suitable for initial proofs-of-concept, this approach risked configuration drift between the controller, the remote measurement runner, and the comparison scripts.
 
-To establish a single source of truth, JouleQuest was updated with a canonical, \textbf{spec-driven architecture pipeline} (\texttt{layers/pruned\_resnet.py}):
+To establish a single source of truth, we updated JouleQuest with a canonical, \textbf{spec-driven architecture pipeline} (\texttt{layers/pruned\_resnet.py}):
 \begin{enumerate}
     \item \textbf{Single source of truth}: The per-layer JouleNAS pruning JSON log serves as the sole input. The class \texttt{PrunedResNet18Spec.from\_pruning\_log} parses the log, validates tensor shapes, and propagates spatial resolutions.
     \item \textbf{Deterministic architecture identity}: From the validated configuration, the spec generates a canonical JSON representation and hashes it into a deterministic SHA-256 identifier (\texttt{architecture\_id}). This ID is embedded into measurement manifests, log files, and processed summary CSVs.
     \item \textbf{Cross-host deployment without filesystem coupling}: When launching remote experiments over SSH, the compact canonical JSON payload is passed directly via command-line arguments (\texttt{--pruned-config-json}), allowing the remote runner to instantiate the model dynamically (\texttt{PrunedResNet18\_32\_10.pt}) without requiring matching repository or log paths on controller and target boards.
-    \item \textbf{Backwards compatibility}: The tool \texttt{materialize\_pruned\_model.py} is retained strictly for offline inspection and verification (the former \texttt{--update-resnet} option was deprecated and removed), and historical named model classes are preserved as compatibility aliases.
+    \item \textbf{Backwards compatibility}: We retain \texttt{materialize\_pruned\_model.py} strictly for offline inspection and verification (the former \texttt{--update-resnet} option was deprecated and removed), preserving historical named model classes as compatibility aliases.
 \end{enumerate}
 
 \subsection{Handling residual shortcuts and BatchNorm}
@@ -76,7 +77,7 @@ For each target architecture, the \texttt{pruned\_resnet18} suite automatically 
 Physical testing on the Raspberry~Pi~5 revealed two key operational parameters for CPU-based embedded devices:
 \begin{itemize}
     \item \textbf{Inter-burst cooldown}: With a brief 3-second sleep, residual thermal buildup and dynamic CPU frequency scaling distorted dense baseline calibration. Extending the sleep period to 10~seconds allowed the CPU to cool completely between bursts.
-    \item \textbf{CPU thread allocation}: Because the original layer lookup table on the Raspberry~Pi~5 was profiled utilizing the full quad-core Cortex-A76 processor, we explicitly enforced 4 CPU threads (\texttt{CPU\_THREADS=4}) on the measurement runner to maintain strict hardware parity.
+    \item \textbf{CPU thread allocation}: Because the original layer lookup table on the Raspberry~Pi~5 was profiled using the full quad-core Cortex-A76 processor, we explicitly enforced 4 CPU threads (\texttt{CPU\_THREADS=4}) on the measurement runner to maintain strict hardware parity.
 \end{itemize}
 Under these stabilized, 4-thread conditions:
 \begin{itemize}
@@ -109,7 +110,7 @@ Here, $E_{\text{residual}}$ explicitly isolates the physical energy attributable
 \noindent\textit{[Note: This subsection was written by the AI assistant to document and analyze the experimental validation results on NVIDIA Jetson AGX Orin at batch size 32. The content has not been revised.]}
 \vspace{0.5em}
 
-To close the loop on the embedded GPU target and explore batch scaling behavior on physical silicon, we deployed the materialized \texttt{PrunedOrinBs32ResNet18} (derived from the optimal $\lambda_E = 1.20$ checkpoint) alongside the dense baseline on the physical NVIDIA Jetson AGX Orin at batch size 32. While earlier testing used a temporary script (\texttt{validate\_agx\_orin\_bs32.sh}), that dedicated wrapper was deprecated and removed in favor of the general campaign launcher:
+To close the loop on the embedded GPU target and explore batch scaling behavior on physical silicon, we deployed the materialized \texttt{PrunedOrinBs32ResNet18} (derived from the optimal $\lambda_E = 1.20$ checkpoint) alongside the dense baseline on the physical NVIDIA Jetson AGX Orin at batch size 32. While earlier testing used a temporary script (\texttt{validate\_agx\_orin\_bs32.sh}), we deprecated that dedicated wrapper in favor of the general campaign launcher:
 \begin{lstlisting}
 BACKEND=cuda NETWORK_BATCH_SIZE=32 \
 ./run_measurement_campaign.sh \

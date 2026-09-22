@@ -1,46 +1,26 @@
 % !TeX root = ../report_jouleecosystem.tex
 \chapter{JouleQuest: Measurement and data-acquisition layer}
 
-This chapter introduces \textbf{JouleQuest}, the automated measurement tool. JouleQuest runs AI models (like single Conv2d layers or full ResNet18 networks) on a target board and measures their power consumption using an INA226EVM sensor. Once you configure the hardware and software, a single command runs the entire experiment.
+This chapter introduces \textbf{JouleQuest}, an automated hardware measurement pipeline. JouleQuest executes neural network workloads (ranging from isolated \texttt{Conv2d} layers to complete ResNet-18 models) on target edge boards and profiles their power consumption using an INA226 power sensor. Once hardware and network settings are configured, a single command orchestrates the entire measurement campaign.
 
-The official documentation in the repository contains the full details. The \texttt{README.md} is the main reference for commands, and the \texttt{docs\_new/} directory provides detailed guides:
+The repository's official documentation provides technical references: \texttt{README.md} outlines primary commands, and the \texttt{docs\_new/} directory provides detailed architectural guides:
 \begin{itemize}
-    \item \texttt{experiment\_campaign.md} --- the complete campaign matrix:
-    which layer families, widths, boards, and operating conditions were
-    measured, and why those measurements were chosen.
-    \item \texttt{adaptive\_burst\_measurement.md} --- the dynamic inferences-per-burst protocol, explaining how the acquisition logic keeps each energy sample stable, repeatable, and within the intended time budgets (recommended reading, section \ref{subsec:adaptive_burst}).
-    \item \texttt{joulegrad\_energy\_estimation.md} --- the bridge between
-    raw measurements and the lookup table used downstream by JouleGrad,
-    showing how the data are transformed into a usable estimator input.
-    \item \texttt{cli\_acquisition\_report.md} --- explains how to run measurements
-    directly from the Linux terminal instead of using the graphical interface,
-    testing communication speed and commands with the sensor.
-    \item \texttt{energy\_lookup\_table\_measurement\_audit.md} --- checks that
-    the final lookup tables accurately match the real measurements taken from
-    the board.
-    \item \texttt{run\_manager\_update.md} --- explains the changes and new
-    features added to \texttt{run\_manager.py} compared to the older version of
-    JouleQuest.
-    \item \texttt{terminal\_acquisition\_full\_report.md} --- provides detailed internal
-    documentation on the terminal acquisition architecture, setup prerequisites,
-    and sequence of steps for unattended or headless measurement campaigns.
-    \item \texttt{pruned\_resnet\_}\allowbreak\texttt{measurement.md} --- documents the spec-driven
-    workflow for pruned ResNet-18 composition measurements, detailing how a
-    single JouleNAS pruning log drives dynamic model construction, component
-    layer scheduling, deterministic architecture hashing, and physical validation.
+    \item \texttt{experiment\_campaign.md} --- the complete measurement matrix: layer families, channel dimensions, boards, and environmental constraints.
+    \item \texttt{adaptive\_burst\_measurement.md} --- the dynamic inferences-per-burst protocol, explaining how adaptive sizing maintains measurement stability within target acquisition windows (Section~\ref{subsec:adaptive_burst}).
+    \item \texttt{joulegrad\_energy\_estimation.md} --- the pipeline transforming raw sensor traces into structured lookup tables consumed by JouleGrad.
+    \item \texttt{cli\_acquisition\_report.md} --- instructions for executing headless measurements from the Linux terminal rather than a GUI, verifying serial baud rates and sensor registers.
+    \item \texttt{energy\_lookup\_table\_measurement\_audit.md} --- statistical validation verifying that compiled lookup tables faithfully reflect empirical board measurements.
+    \item \texttt{run\_manager\_}\allowbreak\texttt{update.md} --- architectural overview of new features and execution safeguards added to \texttt{run\_manager.py}.
+    \item \texttt{terminal\_acquisition\_full\_report.md} --- detailed internal documentation on the headless acquisition daemon, prerequisites, and automated multi-burst sequencing.
+    \item \texttt{pruned\_resnet\_}\allowbreak\texttt{measurement.md} --- documents the spec-driven workflow for pruned ResNet-18 composition measurements, detailing how a single JouleNAS pruning log drives dynamic model construction, component layer scheduling, deterministic architecture hashing, and physical validation.
 \end{itemize}
-This chapter summarizes the full workflow and adds the context that only
-makes sense when the measurement protocol and the data processing are
-considered together.
+This chapter summarizes the end-to-end measurement workflow, highlighting how acquisition protocols and post-processing tools operate together.
 
 \section{Hardware configuration}
-This section extends the hardware setup described in previous work. Depending on the board's power requirements, we used two configurations:
+Depending on the board's electrical requirements, the test bench supports two power configurations:
 \begin{itemize}
-    \item \textbf{Low power} (Figure \ref{fig:low_supplier}): Raspberry PI5,
-    Jetson Nano. The supplier already has the black and red connectors ready
-    to be inserted in the board, so no extra cabling is required.
-    \item \textbf{High power} (Figure \ref{fig:high_supplier}): Jetson Nano
-    Orin, Jetson AGX Orin. The supplier needs a cable extension to work (Figure \ref{fig:high_extend}).
+    \item \textbf{Low power} (Figure \ref{fig:low_supplier}): Raspberry~Pi~5, Jetson~Nano. The power supply provides integrated terminal connectors ready for board headers without custom cabling.
+    \item \textbf{High power} (Figure \ref{fig:high_supplier}): Jetson Orin~Nano, Jetson AGX~Orin. The supply interfaces via dedicated barrel cable extensions (Figure \ref{fig:high_extend}).
 \end{itemize}
 
 \begin{figure}
@@ -113,16 +93,11 @@ You do \emph{not} need the full repository on the board. JouleQuest uses a two-h
 Two machines are involved:
 
 \begin{itemize}
-    \item \textbf{The PC} is connected to the TI-SCB over USB. It runs the
-    orchestrator (\texttt{automated\_measurement.py}) and the logger
-    (\texttt{ina226\_serial\_logger.py}), which writes the raw INA226
-    samples to CSV. Python and \texttt{pyserial} required.
-    \item \textbf{The board} (Jetson, Raspberry, \dots) runs the model. It
-    needs three files --- \texttt{run\_manager.py}, \texttt{runner.py},
-    \texttt{base\_runner.py} and the \texttt{layers} directory for more advanced experiments (e.g. resnet, attention).
+    \item \textbf{The PC}: Connected to the TI-SCB via USB, it executes the orchestrator (\path{automated_measurement.py}) and the serial logger (\path{ina226_serial_logger.py}), streaming raw INA226 samples to CSV. Requirements: Python and \texttt{pyserial}.
+    \item \textbf{The board} (Jetson, Raspberry~Pi~5, etc.): Runs the inference workloads. It requires \path{run_manager.py}, \path{runner.py}, \path{base_runner.py}, and the \texttt{layers/} directory for full networks and component suites.
 \end{itemize}
 
-To prepare a \emph{new} board, copy the inference-side scripts over SSH:
+To provision a \emph{new} board, transfer the inference runner scripts over SSH:
 
 \begin{lstlisting}
 scp -r run_manager.py runner.py base_runner.py layers\
@@ -130,10 +105,7 @@ scp -r run_manager.py runner.py base_runner.py layers\
   BENCH_USER@INFERENCE_HOST:/path/to/JouleQuest/
 \end{lstlisting}
 
-On the PC side, clone the repository and install the acquisition
-dependencies (the logger needs \texttt{pyserial}; the result-processing
-scripts need \texttt{pandas}, \texttt{scikit-image} and
-\texttt{matplotlib}):
+On the PC controller, install the acquisition dependencies (\texttt{pyserial} for serial logging; \texttt{pandas}, \texttt{scikit-image}, and \texttt{matplotlib} for report generation):
 
 \begin{lstlisting}
 python -m pip install -r Docs/INA226EVM/requirements.txt
@@ -142,15 +114,9 @@ python -m pip install pandas scikit-image matplotlib
 
 \subsection{SSH configuration}
 
-SSH is the most common failure point of the whole setup: \textbf{if SSH asks for a password, the run fails}, because the automation runs with
-\texttt{BatchMode=yes} and cannot type one. Set up key based authentication
-\emph{before} launching anything --- the quickest way is
-\texttt{ssh-copy-id} --- and remember also to authorize the jump host, if
-your board is reached through one.
+SSH authentication is the most common operational failure point: \textbf{if SSH prompts for a password, the run fails immediately}, because the automated controller runs with \texttt{BatchMode=yes}. Configure key-based authentication \emph{before} launching campaigns---typically with \texttt{ssh-copy-id}---and remember to authorize the jump host if connecting through a gateway.
 
-The last piece of configuration is a small JSON file that tells the PC where
-the board is: \texttt{measurement\_hosts.local.json}. 
-You should start editing it with any text editor:
+The final prerequisite is configuring the target connection in \path{measurement_hosts.local.json}:
 
 \begin{lstlisting}
 cp measurement_hosts.example.json measurement_hosts.local.json
@@ -212,37 +178,20 @@ configuration is complete and you can move on to running measurements.
 
 \section{How it works, technically}
 
-You \emph{can} skip this section and still use JouleQuest --- but you
-shouldn't. A quick read will help you understand the files you get back and
-spot unusual results, it also explains the reasoning behind some
-parameter choices, like the sampling rate. Nothing here requires action from
-you: everything described below happens automatically.
+While you can run JouleQuest without reading this section, understanding its internals helps you interpret the resulting traces and diagnose abnormal runs; it also explains key parameter choices like sampling rates and idle windows. Everything described below happens automatically.
 
 \subsection{One experiment, start to finish}
 
-Each experiment is driven by \texttt{automated\_measurement.py} on the PC,
-and goes through the same steps every time:
+Each experiment is driven by \texttt{automated\_measurement.py} on the PC, and executes the same sequence:
 
 \begin{enumerate}
     \item The PC starts the experiment on the board over SSH.
-    \item The board runs a \textbf{warm-up} (not measured): the first forward
-    pass is slower than the others, because the GPU and the libraries need a
-    moment to get ready, so one burst is executed and deliberately thrown away.
-    \item The board runs a short \textbf{calibration} (not measured): it
-    times a few small batches to learn how long one inference takes, and
-    from that it computes how many inferences are needed to make each
-    measured burst long enough.
-    \item The board tells the PC to \textbf{start recording}: the INA226
-    logger begins writing power samples to a CSV file.
-    \item The \textbf{measured cycles} run: a few bursts with idle pauses in
-    between, plus some idle time before and after, so the baseline
-    consumption can be subtracted later.
-    \item The board tells the PC to \textbf{stop recording}. The logger
-    closes the file \emph{before} the board writes its report, so this final
-    bookkeeping never pollutes the measurement.
-    \item The PC downloads the report (called \emph{manifest}), saves it next
-    to the CSV, and deletes the copy on the board to save space (use
-    \texttt{--keep-remote-manifest} if you want to keep it for debugging).
+    \item The board executes a \textbf{warm-up} burst (not measured): because initial forward passes incur framework and CUDA context initialization latency, this initial burst is discarded.
+    \item The board runs a short \textbf{calibration} burst (not measured): it profiles a few small batches to determine single-inference latency, and computes how many inferences are needed to fill the target measurement window.
+    \item The board signals the PC to \textbf{start recording}: the INA226 logger begins streaming power samples to a CSV file.
+    \item The \textbf{measured cycles} execute: multiple workload bursts interleaved with idle pauses, preceded and followed by baseline windows so static platform power can be subtracted during analysis.
+    \item The board signals the PC to \textbf{stop recording}. The logger closes the CSV file \emph{before} the board generates its summary manifest, preventing disk I/O from contaminating the power trace.
+    \item The PC retrieves the manifest JSON, stores it alongside the CSV, and removes the remote copy on the board (unless \texttt{--keep-remote-manifest} is passed for debugging).
 \end{enumerate}
 
 Each experiment leaves exactly two files behind:
@@ -252,21 +201,13 @@ measurements/runs/<campaign_id>.csv    # raw INA226 samples
 measurements/runs/<campaign_id>.json   # the manifest
 \end{lstlisting}
 
-The manifest is the experiment's report card: what was measured, how long
-each burst lasted, the real sampling rate, and a \texttt{quality\_status}
-flag. The command's exit code sums everything up: \texttt{0} all good,
-\texttt{2} the model ran but the recording is invalid, \texttt{1} the experiment failed, \texttt{130} you stopped it with \texttt{Ctrl+C} (and
-everything was cleaned up properly).
+The manifest summarizes experiment execution: layer shape, burst duration, measured sampling rate, and a \texttt{quality\_status} flag. The process exit code indicates status: \texttt{0} (success), \texttt{1} (execution failure), \texttt{2} (model executed but recording is invalid), or \texttt{130} (interrupted cleanly with \texttt{Ctrl+C}).
 
 Furthermore, to guarantee rigorous benchmarking on multi-core CPU targets (such as the Raspberry~Pi~5), the execution harness supports an explicit \texttt{CPU\_THREADS} variable forwarded by \texttt{run\_measurement\_campaign.sh} over SSH. The execution environment---including configured threads, active PyTorch thread count, and available cores---is certified directly in the manifest under \texttt{runner\_environment}. Because this metadata is recorded during the initial setup phase outside the measurement window, it introduces zero I/O or CPU overhead during the active inference bursts.
 
 \subsection{Why the bursts are ``adaptive''} \label{subsec:adaptive_burst}
 
-Older versions of this project ran the same huge number of inferences for
-every layer. That worked, but it wasted a lot of time on slow layers while
-being too short to be meaningful for fast ones. Now the length of each burst
-is computed automatically, so that every measured region is long enough both
-in \emph{time} and in \emph{number of samples}:
+Older versions of this project ran the same huge number of inferences for every layer. That worked, but it wasted a lot of time on slow layers while being too short to be meaningful for fast ones. Now the length of each burst is computed automatically, so that every measured region is long enough both in \emph{time} and in \emph{number of samples}:
 
 $$
 T_{\text{required}} =
@@ -283,10 +224,7 @@ where:
     \item $m$ is a safety margin (\texttt{--burst\_duration\_margin},
     default $1.2$, i.e. 20\% longer than strictly needed).
 \end{itemize}
-In words: the burst must last at least \texttt{--target\_burst\_seconds},
-\emph{and} it must contain enough samples for the statistics to be
-meaningful --- whichever of the two asks for more time wins, plus the safety
-margin. For my experiments I have not used a target in seconds but in a minimum amount of active samples = 100.
+In words: the burst must last at least \texttt{--target\_burst\_seconds}, \emph{and} it must contain enough samples for the statistics to be meaningful---whichever condition requires more time sets the duration, scaled by the safety margin. In our benchmarking campaigns, we configured a minimum of $100$ active samples (\texttt{--min\_active\_samples 100}) rather than a fixed time window, ensuring consistent statistical power across both fast and slow layers.
 
 \textbf{One practical note on the sampling rate}. The INA226 can, in principle, go
 above the 100\,Hz we use in the campaigns, so it is natural to ask why
@@ -481,7 +419,7 @@ One thing that can confuse at first: \texttt{--model} is a path
 \emph{on the board}, while \texttt{--output-directory} is \emph{on the PC}.
 And ``path'' is maybe not so accurate as word: a full file path is only needed if
 you actually have a checkpoint to load. The notation above
-(\texttt{Models/CUDA/Linear/Linear\_64\_64.pt}) is enough --- if the file
+(\texttt{Models/CUDA/}\allowbreak\texttt{Linear/}\allowbreak\texttt{Linear\_64\_64.pt}) is enough --- if the file
 does not exist, the runner simply reads the base path (\texttt{Linear\_64\_64.pt}), extracts the
 architecture and dimensions from the name, and starts from randomly
 initialized parameters. This is the default configuration, and it is exactly
@@ -535,7 +473,7 @@ Things worth knowing:
     variables at the top of the script, and can be overridden with
     environment variables --- no need to edit the script itself.
     \item If the board tends to heat up, add a pause between experiments
-    with \texttt{--experiment-cooldown-seconds 60}.
+    with \texttt{--experiment-}\allowbreak\texttt{cooldown-seconds 60}.
 \end{itemize}
 
 The complete campaign matrix (which Linear, Conv and attention
@@ -545,7 +483,7 @@ configurations are measured, and with which parameters) is documented in
 \subsection{Current measurement setup and campaign parameters}
 \label{subsec:campaign_setup}
 
-The full execution parameters for each campaign are orchestrated by \texttt{run\_measurement\_campaign.sh} and enforced on the target board by \texttt{run\_manager.py}. To guarantee that measurements across different boards (Raspberry~Pi~5, Jetson Nano, Jetson Orin Nano, Jetson AGX Orin) are reproducible, thermally stable, and statistically reliable, the campaign enforces a standardized set of operational hyperparameters.
+The full execution parameters for each campaign are orchestrated by \texttt{run\_}\allowbreak\texttt{measurement\_}\allowbreak\texttt{campaign.sh} and enforced on the target board by \texttt{run\_manager.py}. To guarantee that measurements across different boards (Raspberry~Pi~5, Jetson Nano, Jetson Orin Nano, Jetson AGX Orin) are reproducible, thermally stable, and statistically reliable, the campaign enforces a standardized set of operational hyperparameters.
 
 Table~\ref{tab:campaign_parameters} details the essential configuration parameters governing each measurement run:
 
@@ -714,7 +652,7 @@ $$
 The convolutional space spans four dimensions: input channels, spatial feature-map resolution, output channels, and kernel/padding geometries. Table~\ref{tab:conv-matrix} visualizes the primary base configuration plane:
 \begin{itemize}
     \item \textbf{Rows represent the input channel depth}: $C_{\text{in}} \in \{1, 2, 4, 8, 16,$ $32, 64, 128, 256, 512\}$.
-    \item \textbf{Columns represent the square spatial resolution}: $H = W \in \{32, 64, 128, 256, 512, 1024\}$.
+    \item \textbf{Columns represent the square spatial resolution}: $H = W \in \{32, 64, 128,$ $256, 512, 1024\}$.
 \end{itemize}
 
 A naive Cartesian product of 10 channel counts $\times$ 6 spatial resolutions would yield 60 pairs. However, modern computer-vision architectures do not combine deep channel stacks with massive spatial resolutions (such as 512 channels at $1024 \times 1024$), and allocating such intermediate activation tensors would trigger out-of-memory errors on edge devices. Therefore, the launcher enforces resolution caps: channels $1$--$8$ permit resolutions up to 1024; channels $16$--$32$ up to 512; channels $64$--$128$ up to 256; channel 256 up to 128; and channel 512 up to 64. Combinations exceeding these caps are skipped (marked by dashes `---' in Table~\ref{tab:conv-matrix}), leaving exactly 47 valid base pairs (marked by bullets `$\bullet$').
@@ -815,7 +753,7 @@ MPLBACKEND=Agg python processing_report/process_and_visualize.py \
   --output-name BOARD_LABEL.csv
 \end{lstlisting}
 
-By default, the script reads all colocated CSV and JSON manifest pairs in \texttt{--data-dir}, generates per-measurement plot PDFs in \texttt{--plot-dir} (defaulting to \texttt{measurements/Plot/<data\_dir\_name>}), and writes the consolidated summary table directly into \texttt{measurements/}\allowbreak\texttt{lookup\_summaries/}\allowbreak\texttt{summaries/<BOARD\_LABEL>.csv}. The summary destination is controlled by \texttt{--summary-dir} (defaulting to \texttt{measurements/}\allowbreak\texttt{lookup\_summaries/}\allowbreak\texttt{summaries}) and \texttt{--output-name} (aliased as \texttt{--summary-name}, defaulting to \texttt{<data\_dir\_name>.csv}).
+By default, the script reads all colocated CSV and JSON manifest pairs in \texttt{--data-dir}, generates per-measurement plot PDFs in \texttt{--plot-dir} (defaulting to \texttt{measurements/}\allowbreak\texttt{Plot/}\allowbreak\texttt{<data\_dir\_name>}), and writes the consolidated summary table directly into \texttt{measurements/}\allowbreak\texttt{lookup\_summaries/}\allowbreak\texttt{summaries/}\allowbreak\texttt{<BOARD\_LABEL>.csv}. The summary destination is controlled by \texttt{--summary-dir} (defaulting to \texttt{measurements/}\allowbreak\texttt{lookup\_summaries/}\allowbreak\texttt{summaries}) and \texttt{--output-name} (aliased as \texttt{--summary-name}, defaulting to \texttt{<data\_dir\_name>.csv}).
 
 Only finished experiments (\texttt{status: COMPLETE} in the manifest) are
 processed; incomplete ones are listed and skipped. For each burst, the
@@ -842,7 +780,7 @@ dips. For our campaigns we therefore discarded:
 
 Trimming is applied per cycle, and only when the cycle ran long enough to
 afford it --- the processor skips it entirely below a minimum number of
-inferences (\texttt{--min-inferences-for-trimming}, 10 by default), where
+inferences (\texttt{--min-inferences-}\allowbreak\texttt{for-trimming}, 10 by default), where
 every sample is precious. The code's out-of-the-box defaults are more
 conservative (1\% tails, no initial discard unless the flag is passed), so
 to reproduce our processing exactly, say it on the command line:
@@ -916,25 +854,9 @@ exactly'' depends on the board:
     \item \textbf{Late-stage finding --- ResNet-18 on AGX Orin (CIFAR-10, batch 32):} In the subsequent cross-batch validation campaign on the NVIDIA Jetson AGX Orin, we investigated whether increasing batch size to 32 would amortize kernel launch latency and eliminate the composition discrepancy. The empirical result was striking: the complete dense ResNet-18 consumed $1.368$\,mJ per sample (total batch energy $43.78$\,mJ), matching the standalone lookup table sum ($1.372$\,mJ) within an astonishing $0.3\%$ margin (coverage: $99.7\%$). Rather than a definitive proof, this provides an encouraging hint to consider: as batch size increases, framework and kernel launch overheads become amortized, suggesting that batching may improve composability between isolated layer profiles and full-network energy.
 \end{itemize}
 
-Our working \textbf{hypothesis} is that the gap is a \textbf{cache effect}. Measured
-standalone, each operation runs in a loop over its own tensors: weights and
-activations stay hot in the cache hierarchy, and the measured energy
-reflects mostly computation. Inside the full network, each layer receives
-its input from the previous one, and the working set of the whole model is
-larger than what the caches can hold --- data keep moving between cache
-levels and main memory, and that movement costs energy that standalone
-measurements never see. The Raspberry~Pi~5, with the smallest caches of the
-three boards, shows exactly the largest gap; the AGX Orin, with a much
-larger cache hierarchy, can instead exploit producer--consumer locality
-between consecutive layers and the composition turns favorable. This is a
-hypothesis supported by the sign and magnitude of the observed gaps --- it
-has not been verified directly (e.g. with hardware performance counters),
-and verifying it is part of the future work listed below.
+Our working \textbf{hypothesis} attributes this discrepancy primarily to a \textbf{cache effect}. Measured in isolation, each operation executes in a tight loop over its own tensors: weights and activations stay hot in the cache hierarchy, and measured energy reflects almost pure arithmetic computation. Inside a complete network, each layer consumes the output of the preceding one, expanding the working set beyond on-chip cache capacity; data continuously traverse cache levels and DRAM, incurring memory bus overhead that standalone layer measurements never see. The Raspberry~Pi~5, with the smallest caches among the evaluated boards, exhibits the largest gap; the AGX~Orin, with a substantially larger cache hierarchy, can instead exploit producer--consumer locality between consecutive layers, shifting composition favorably. While the sign and magnitude of the observed gaps support this hypothesis, verifying it directly with hardware performance counters (PMUs) remains an important future objective.
 
-Keep the gap in mind when reading JouleGrad's estimates: they are built
-from standalone measurements, so on cache-poor boards they will
-underestimate the energy of a large composed network by an amount that, as
-the Pi~5 case shows, can reach $20$--$30\%$.
+Keep this gap in mind when evaluating JouleGrad's estimates: because they are compiled from standalone measurements, on cache-constrained boards they can underestimate the energy of a large composed network by $20$--$30\%$, as demonstrated by the Raspberry~Pi~5 baseline.
 
 \subsection{Open directions}
 
@@ -1005,7 +927,9 @@ energy), see the long-form notes in the repository:
     \item \texttt{docs\_new/adaptive\_burst\_measurement.md} --- protocol
     and the parameter reference table (Section 9);
     \item \texttt{docs\_new/experiment\_campaign.md} --- the campaign
-    matrix and launcher examples.
+    matrix and launcher examples;
+    \item \texttt{docs\_new/pruned\_resnet\_measurement.md} --- the spec-driven
+    pipeline and physical validation protocol.
 \end{itemize}
 
 

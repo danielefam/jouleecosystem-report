@@ -33,38 +33,38 @@ The repository includes several documentation files to guide you:
     \item \texttt{docs/RESNET18\_CIFAR10\_ICPR\_COMPARISON.md}
     --- Compares a standard baseline with an energy-aware run on CIFAR-10.
 \end{itemize}
-While this chapter explains the core ideas and how to run them, you can check those documents for exact training details and deeper insights into the energy search. Note that, unlike JouleGrad which is publicly hosted on GitHub, the JouleNAS repository is and will remain private at the moment. Its formulation, hyperparameter controls, and experimental results are nonetheless documented in detail in this report to serve as an exact reference.
+While this chapter explains the core optimization mechanisms and campaign commands, the repository documents provide exact configuration details. Unlike JouleGrad, which is public on GitHub, the JouleNAS codebase is currently private; its mathematical formulation, hyperparameter schedules, and empirical Pareto curves are fully documented here to ensure complete reproducibility.
 
 \section{How the mask optimization works}
 
-During this phase, only the mask logits are updated; the main network weights and BatchNorm statistics remain frozen. For each channel $i$, the gating mechanism relies on five variables:
+During mask optimization, only the mask logits are updated; backbone network weights and BatchNorm statistics remain frozen. For each channel $i$, the gating mechanism relies on five variables:
 
 \begin{itemize}
-    \item $m_i \in (-\infty, +\infty)$ (\textbf{mask logit}): A learnable score for channel $i$, updated via gradient descent. A positive score keeps the channel open, while a negative score drops it.
-    \item $\tau \in (0, +\infty)$ (\textbf{temperature}): A scaling parameter that makes the sigmoid curve steeper over time. It starts at $1.0$ and halves every 10 epochs ($1.0 \to 0.5 \to 0.25 \dots$).
+    \item $m_i \in (-\infty, +\infty)$ (\textbf{mask logit}): A learnable score for channel $i$, updated by gradient descent. A positive score retains the channel; a negative score prunes it.
+    \item $\tau \in (0, +\infty)$ (\textbf{temperature}): An annealing parameter that sharpens the sigmoid curve over time. It initializes at $1.0$ and halves every 10 epochs ($1.0 \to 0.5 \to 0.25 \dots$).
     \item $p_i \in (0, 1)$ (\textbf{channel probability}): The soft probability of keeping channel $i$, computed with a standard sigmoid:
     $$
     p_i = \sigma(m_i / \tau) = \frac{1}{1 + e^{-m_i / \tau}}.
     $$
     When $m_i = 0$, $p_i = 0.50$.
-    \item $\theta \in [0, 1]$ (\textbf{threshold}): The cutoff that turns probabilities into hard decisions. We start at $0.49$ for the first 20 epochs, then tighten it to $0.50$.
-    \item $g_i \in \{0, 1\}$ (\textbf{binary gate}): The actual switch for channel $i$. We compute it with the step function $H$:
+    \item $\theta \in [0, 1]$ (\textbf{threshold}): The decision cutoff. We set $\theta = 0.49$ for the first 20 epochs, then tighten it to $0.50$.
+    \item $g_i \in \{0, 1\}$ (\textbf{binary gate}): The discrete execution switch for channel $i$, computed with the Heaviside step function $H$:
     $$
     g_i = H(p_i - \theta) = \begin{cases} 1 & \text{if } p_i \ge \theta \\ 0 & \text{if } p_i < \theta \end{cases}
     $$
 \end{itemize}
 
-During the forward pass, channel $i$'s feature map is multiplied by its gate $g_i$. If $g_i = 1$, the channel passes normally; if $g_i = 0$, it is completely zeroed out. In the backward pass, gradients flow through the step function back to the logits $m_i$ using the straight-through estimator (STE).
+During the forward pass, channel $i$'s feature map is multiplied by its gate $g_i$. If $g_i = 1$, features pass unmodified; if $g_i = 0$, the channel is zeroed out. In the backward pass, gradients flow through the step function back to the logits $m_i$ via the straight-through estimator (STE).
 
-As training goes on and the temperature $\tau$ drops, the probabilities $p_i$ polarize toward 0 or 1.
+As training proceeds and the temperature $\tau$ decays, the soft probabilities $p_i$ polarize toward 0 or 1.
 
 \section{How the energy term is computed}
 
-The loss's second term, $\widehat{E}$, is the JouleGrad estimate for the masked model's inference energy. Let's look at how we define effective layer sizes and why this estimate is differentiable.
+The regularization term $\widehat{E}$ estimates inference energy using JouleGrad. Below, we define effective layer dimensions and explain how gradients backpropagate through the lookup grid.
 
 \subsection{Discrete versus continuous energy modes}
 \label{subsec:energy_mode}
-JouleNAS offers two ways to compute effective layer sizes from the learned masks:
+JouleNAS provides two formulations for computing effective layer sizes from learned masks:
 
 \begin{enumerate}
     \item \textbf{Discrete mode} (\texttt{--energy-mode discrete}, default):
@@ -72,20 +72,20 @@ JouleNAS offers two ways to compute effective layer sizes from the learned masks
     $$
     d^{(\ell)}_{\text{eff}} = \sum_{i=1}^{C_\ell} g^{(\ell)}_i = \sum_{i=1}^{C_\ell} H(p^{(\ell)}_i - \theta),
     $$
-    where $C_\ell$ is the total number of channels in layer $\ell$.
-    This looks up the energy of the pruned model using only the open channels.
-    During the backward pass, gradients flow through the straight-through estimator: $\partial g_i / \partial m_i \approx p_i (1 - p_i) / \tau$.
+    where $C_\ell$ is the total channel capacity of layer $\ell$.
+    This looks up pruned model energy using only active channels.
+    During backpropagation, gradients pass through the straight-through estimator: $\partial g_i / \partial m_i \approx p_i (1 - p_i) / \tau$.
 
     \item \textbf{Continuous mode} (\texttt{--energy-mode continuous}):
-    The effective output width $d^{(\ell)}_{\text{eff}}$ is the sum of the soft channel probabilities $p^{(\ell)}_i$:
+    The effective output width $d^{(\ell)}_{\text{eff}}$ is the sum of soft channel probabilities $p^{(\ell)}_i$:
     $$
     d^{(\ell)}_{\text{eff}} = \sum_{i=1}^{C_\ell} p^{(\ell)}_i = \sum_{i=1}^{C_\ell} \sigma(m^{(\ell)}_i / \tau).
     $$
-    Here $d^{(\ell)}_{\text{eff}}$ can take any fractional value between 0 and $C_\ell$, representing the expected number of open channels.
-    Since JouleGrad uses multilinear interpolation, it gracefully handles fractional dimensions to return a smooth energy estimate $\widehat{E}$.
-    In this branch, the non-differentiable step function $H$ is completely bypassed, avoiding abrupt step jumps and yielding a clean, exact analytical gradient for the energy penalty:
+    Here $d^{(\ell)}_{\text{eff}}$ spans continuous values in $[0, C_\ell]$, representing the expected number of active channels.
+    Because JouleGrad employs multilinear interpolation, it evaluates fractional dimensions smoothly to return $\widehat{E}$.
+    In this mode, the step function $H$ is bypassed in the energy path, eliminating step discontinuities and yielding an exact analytical gradient for the energy penalty:
     $\partial \widehat{E} / \partial m_i = (\partial \widehat{E} / \partial d_{\text{eff}}) \cdot (p_i (1 - p_i) / \tau)$.
-    (Note that while the network's classification forward pass still uses binary gates $g_i$ to evaluate real pruned accuracy via STE, the energy branch itself requires no surrogate approximation).
+    (While task evaluation still applies binary gates $g_i$ via STE to evaluate true pruned accuracy, the energy penalty branch requires no surrogate approximation).
 \end{enumerate}
 
 When a layer's input comes from another masked layer, its effective input width $d^{(\ell)}_{\text{eff,in}}$ is determined by that preceding mask. Other dimensions like spatial size, strides, and kernel size remain fixed by the architecture.
@@ -198,12 +198,12 @@ This split means you only train the heavy baseline once, and can run many quick 
 
 A quick tip: your lookup table needs to cover the model's operators at the chosen input size. You can pass \texttt{--energy-out-of-range error} to strictly enforce this, or use a softer JouleGrad policy like \texttt{extrapolate} if your table is incomplete (we used this one).
 
-Each run outputs a metrics CSV (tracking accuracy, active channels, and energy) and a final mask checkpoint, which is ready for the deployment phase discussed in the Future Work chapter.
+Each run outputs a metrics CSV (tracking accuracy, active channels, and energy) and a final mask checkpoint, which is ready for physical deployment and hardware validation (Chapter~\ref{chap:bridge}).
 
 \section{Experimental results and what they tell us}
 \label{sec:experimental_results}
 
-We evaluated JouleNAS by applying the energy-constrained mask optimization to ResNet-18 across two benchmark computer vision datasets: CIFAR-10 ($32 \times 32$ image resolution) and Imagenette ($224 \times 224$ image resolution). Experiments were conducted across two distinct edge hardware platforms with vastly different architectural and energy profiles:
+We evaluated JouleNAS by applying energy-constrained mask optimization to ResNet-18 across two benchmark computer vision datasets: CIFAR-10 ($32 \times 32$ image resolution) and Imagenette ($224 \times 224$ image resolution). We ran experiments on two distinct edge platforms with very different architectures and energy footprints:
 \begin{itemize}
     \item \textbf{NVIDIA Jetson AGX Orin}: an embedded GPU system with massive parallel compute capacity, consuming $18.51\text{ mJ}$ per dense CIFAR-10 inference and $19.32\text{ mJ}$ per dense Imagenette inference;
     \item \textbf{Raspberry Pi 5}: a commodity quad-core ARM Cortex-A76 edge CPU, consuming $35.15\text{ mJ}$ per dense CIFAR-10 inference and $56.41\text{ mJ}$ per dense Imagenette inference.
@@ -327,7 +327,7 @@ With moderate penalties ($\lambda_E \le 0.05$ in continuous mode), the search is
 
 \begin{itemize}
     \item \textbf{Opposite reactions at $\lambda_E = 0.10$}: On Imagenette, discrete mode collapses to random guessing ($9.86\%$ accuracy), while continuous mode stays robust at $84.66\%$. On CIFAR-10, it is the reverse: continuous mode collapses to $10.00\%$, while discrete mode recovers nicely to $90.13\%$ accuracy.
-    \item \textbf{Bizarre scaling}: On CIFAR-10 in discrete mode, the network collapses at a lower penalty ($\lambda_E = 0.05$), but succeeds at a harsher penalty ($\lambda_E = 0.10$).
+    \item \textbf{Non-monotonic behavior}: On CIFAR-10 in discrete mode, the network collapses at a lower penalty ($\lambda_E = 0.05$), but succeeds at a harsher penalty ($\lambda_E = 0.10$).
     \item \textbf{Warmup is not always the solution}: A 10-epoch warmup saves discrete mode at $\lambda_E = 0.10$ on Imagenette, but fails to save discrete mode at $\lambda_E = 0.05$ on CIFAR-10.
 \end{itemize}
 
@@ -610,7 +610,7 @@ The batch-32 results confirm several critical properties of hardware-aware diffe
     \item \textbf{The operational sweet spot ($\lambda_E = 1.20$)}: Pushing the penalty to $\lambda_E = 1.20$ delivers a robust \textbf{$34.58\%$ energy reduction} ($0.898\text{ mJ}$) with $21.67\%$ structural sparsity and an accuracy of $89.26\%$. This operating point provides the highest energy saving margin while comfortably preserving the $>89\%$ accuracy threshold.
     \item \textbf{Aggressive compression ($\lambda_E = 2.50$)}: At $\lambda_E = 2.50$, the model sheds more than a third of its filters ($35.08\%$ sparsity) and cuts inference energy by more than half (\textbf{$51.15\%$ energy reduction} down to $0.670\text{ mJ}$), with accuracy settling at $85.37\%$.
 \end{enumerate}
-These experiments confirm that when GPU launch overheads are amortized by batching, JouleNAS effectively prunes channels in direct proportion to arithmetic workload, confirming that the hardware-aware search generalises across both execution batch sizes and compute regimes.
+These experiments show that when batching amortizes GPU launch overheads, JouleNAS prunes channels in direct proportion to arithmetic workload, demonstrating that our hardware-aware search generalizes across both execution batch sizes and compute regimes.
 
 
 

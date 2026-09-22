@@ -17,14 +17,14 @@
 }
 \item\relax
 
-This report presents a complete pipeline to measure and optimize the energy consumption of neural network inference on edge devices. It introduces three software components:
+This report presents an end-to-end pipeline to measure and optimize neural network inference energy on edge devices. It connects three modular tools:
 
-\textbf{JouleQuest} measures the power of AI workloads on embedded boards (Jetson Nano, Jetson AGX Orin, Raspberry~Pi~5) using an INA226EVM sensor. It builds energy lookup tables for common neural network layers by automating calibration, clock synchronization, and workload sizing.
+\textbf{JouleQuest} profiles AI workloads on embedded platforms (Jetson~Nano, Jetson AGX~Orin, Raspberry~Pi~5) using an INA226 power sensor. It automates calibration, clock synchronization, and burst sizing to build physical energy lookup tables for isolated neural network layers.
 
-\textbf{JouleGrad} turns these tables into differentiable energy estimates, allowing us to use them as penalties during neural network training.
+\textbf{JouleGrad} turns these empirical tables into differentiable energy estimates, making hardware cost a direct regularization penalty during training.
 
-\textbf{JouleNAS} uses these estimates to perform an energy-aware search for the best channels in frozen networks (SimpleConv and ResNet-18 on CIFAR-10 and Imagenette). This finds architectures specifically optimized for the energy cost of the target board. 
+\textbf{JouleNAS} uses these estimates to guide channel pruning on frozen vision backbones (SimpleConv and ResNet-18 on CIFAR-10 and Imagenette), discovering architectures tailored to each board's real physical energy costs.
 
-Part of this report serves as a practical guide for future developers to extend the project and collect new measurements.
+Finally, this report serves as a practical handbook for future researchers to reproduce the experiments, extend the ecosystem, and profile new embedded hardware.
 
 \end{list}

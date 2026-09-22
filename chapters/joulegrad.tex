@@ -2,70 +2,66 @@
 \chapter{JouleGrad: Differentiable energy-estimation layer}
 \label{chapter:joulegrad}
 
-JouleGrad is a small Python library that turns JouleQuest measurements into \emph{differentiable} energy estimates. It reads an \texttt{energy\_lookup\_table.csv} and answers queries like "how many millijoules does a Linear $128 \to 96$ layer cost?" as PyTorch tensors. This means the answer has a gradient, so you can use it directly as a regularization term during training. It is strictly an API, with no command-line interface or measurement logic. The project is publicly hosted on GitHub at \url{https://github.com/danielefam/joulegrad}.
+JouleGrad is a Python library that converts empirical JouleQuest measurements into \emph{differentiable} energy estimates. Given an \texttt{energy\_lookup\_table.csv}, it queries layer costs (such as a Linear $128 \to 96$ operation) and returns them as PyTorch tensors with backward gradients. These estimates integrate directly into training objectives as regularization penalties. JouleGrad provides a lightweight Python API without measurement logic or CLI overhead. The project is open-source on GitHub at \url{https://github.com/danielefam/joulegrad}.
 
-You can find the official documentation in the \texttt{docs/} directory of the repository. Each file covers a specific topic:
+You can find the official documentation in the \texttt{docs/} directory of the repository:
 \begin{itemize}
-    \item \texttt{API.md} --- User reference for the Python API, including classes, methods, tensor shapes, and examples.
-    \item \path{LOOKUP_SCHEMA.md} --- The schema of the \path{energy_lookup_table.csv}, covering columns, units, and measurement details.
-    \item \texttt{INTERPOLATION.md} --- Explains the multilinear interpolation logic used over the lookup grid.
-    \item \texttt{OPTIMIZATION.md} --- Details the improvements over the old \texttt{energy\_estimator} repository (see Section \ref{sec:optimization_energy_est}).
-    \item \texttt{OUT\_OF\_RANGE\_POLICIES.md} --- Explains how the library handles unsupported coordinates (errors, warnings, clamping, or extrapolation).
-    \item \texttt{MIGRATION\_FROM\_ENERGY\_ESTIMATOR.md} --- A guide for migrating from the older \texttt{energy\_estimator} package.
+    \item \texttt{API.md} --- User reference for classes, methods, tensor signatures, and usage patterns.
+    \item \path{LOOKUP_SCHEMA.md} --- Schema definition for \path{energy_lookup_table.csv}, covering columns, measurement units, and metadata fields.
+    \item \texttt{INTERPOLATION.md} --- Mathematical formulation of the multilinear interpolation logic over multi-dimensional grids.
+    \item \texttt{OPTIMIZATION.md} --- Details engineering optimizations over the legacy \texttt{energy\_estimator} package (Section~\ref{sec:optimization_energy_est}).
+    \item \texttt{OUT\_OF\_RANGE\_POLICIES.md} --- Policy definitions for boundary handling (errors, warnings, clamping, extrapolation).
+    \item \texttt{MIGRATION\_FROM\_ENERGY\_ESTIMATOR.md} --- Migration guide for adapting legacy scripts to the JouleGrad API.
 \end{itemize}
-This chapter introduces the core concepts. For function signatures and practical usage details, check the documentation.
+This chapter presents the core architectural concepts. Refer to the repository documentation for complete function signatures and code examples.
 
 \section{Improvements over energy\_estimator} \label{sec:optimization_energy_est}
 
-JouleGrad replaces an older package (\texttt{energy\_estimator}) that used bundled Excel tables. The rewrite fixes three main issues that surfaced when using real JouleQuest measurements:
+JouleGrad supersedes an earlier prototype (\texttt{energy\_estimator}) that relied on bundled spreadsheet tables. The rewrite eliminates three structural flaws that surfaced during physical hardware profiling:
 
 \begin{itemize}
-    \item \textbf{No more silent extrapolation.} (See Section \ref{sec:extrapolate_section}) The old package silently extrapolated beyond the measured range without warning. JouleGrad makes this explicit: the default \texttt{out\_of\_range="error"} rejects unsupported coordinates. You can still choose approximations like \texttt{warn}, \texttt{clamp}, or \texttt{extrapolate} if needed.
-    \item \textbf{No synthetic zero anchor.} Old tables assumed a zero-width layer had zero energy cost. However, framework and launch overheads still exist. JouleGrad doesn't invent this data point; low-width behavior must be actually measured.
-    \item \textbf{Explicit data sources.} Instead of selecting a bundled file by board name, you now provide the exact file path. This ensures there is no ambiguity about the data you are using.
+    \item \textbf{No silent extrapolation} (Section \ref{sec:extrapolate_section}): The legacy estimator quietly extrapolated beyond measured boundaries without warnings. JouleGrad makes boundary policies explicit: by default, \texttt{out\_of\_range="error"} rejects unsupported coordinates, while \texttt{warn}, \texttt{clamp}, or \texttt{extrapolate} remain configurable alternatives.
+    \item \textbf{No artificial zero anchor}: Legacy tables assumed a zero-width layer incurred zero energy. In reality, kernel dispatches and framework overhead maintain a non-zero energy baseline. JouleGrad never invents synthetic data points; boundary behaviors must be measured empirically.
+    \item \textbf{Explicit data sources}: Rather than selecting bundled tables by board name, users explicitly pass file paths, eliminating ambiguity about calibration data.
 \end{itemize}
 
-For backward compatibility, the old class name is still available as an alias. The model regularizer, one-shot model estimate, and low-level interpolation functions remain public.
+For backwards compatibility, legacy class names remain available as aliases, and model regularizers, one-shot inference estimators, and low-level interpolation functions stay public.
 
 \section{Handling out-of-range queries} \label{sec:extrapolate_section}
 
-A key detail for any estimator is what happens when you query a shape that was never measured. The old package made this choice for you quietly; JouleGrad lets you explicitly configure this via the \texttt{out\_of\_range} parameter in the constructor.
+A critical design requirement for surrogate estimators is handling layer dimensions outside the measured grid. Legacy code resolved this quietly; JouleGrad requires users to select an explicit policy via the \texttt{out\_of\_range} constructor parameter.
 
 \subsection{The problem with silent extrapolation}
 
-If a measured axis ended at $x = 4$ and you queried $x = 5$, the old \texttt{clamp\_index} helper clamped the coordinate to pick the edge cell $[2, 4]$. However, it computed the interpolation fraction using the original $x = 5$:
+If a measured axis ended at $x = 4$ and a user queried $x = 5$, the legacy \texttt{clamp\_index} helper clamped the coordinate to the edge cell $[2, 4]$. However, it computed the interpolation fraction using the original $x = 5$:
 
 $$
 t = \frac{x - x_{\text{lo}}}{x_{\text{hi}} - x_{\text{lo}}}
   = \frac{5 - 2}{4 - 2} = 1.5
 $$
 
-A fraction outside $[0, 1]$ extends the edge cell as a straight line. Thus, \texttt{clamp} was actually doing \textbf{silent linear extrapolation} without any warnings. It was impossible to tell if a result was measured, interpolated, or extrapolated.
+A fraction outside $[0, 1]$ linearly extrapolates beyond the boundary. Thus, \texttt{clamp} produced \textbf{silent linear extrapolation} without diagnostic warnings. Callers could not distinguish whether an estimate was measured, interpolated, or extrapolated.
 
 \subsection{JouleGrad policies}
 
-JouleGrad clearly separates cell selection and interpolation weights, offering distinct policies via \texttt{EnergyEstimator(..., out\_of\_range=...)}:
+JouleGrad decouples cell selection from interpolation weighting, providing four distinct policies via \texttt{EnergyEstimator(..., out\_of\_range=...)}:
 
 \begin{itemize}
-    \item \textbf{\texttt{error}} (default): Raises a \texttt{ValueError} for unmeasured coordinates. Nothing is invented. This is the best choice for reproducible, published results.
-    \item \textbf{\texttt{extrapolate}}: Replicates the old behavior of extending the edge trend. This is now an explicit choice and includes gradients. Note that the result might not stay positive or monotonic. If only one data point exists on an axis, making slope extrapolation impossible, it issues a warning and clamps to that point.
-    \item \textbf{\texttt{clamp}}: Clips the coordinate to the measured range \emph{before} computing interpolation weights. Out-of-range queries simply return the energy of the nearest edge point. The gradient is zero here, so an optimizer won't push the value back into bounds.
-    \item \textbf{\texttt{warn}}: Similar to \texttt{clamp}, but prints a \texttt{RuntimeWarning} for each out-of-range query. Useful for debugging.
+    \item \textbf{\texttt{error}} (default): Raises a \texttt{ValueError} for unmeasured coordinates, guaranteeing strict reliance on verified physical samples. Recommended for benchmark publication.
+    \item \textbf{\texttt{extrapolate}}: Extends edge trends linearly while tracking gradients. Caution is required because values can drift non-monotonically. If an axis contains only one point (precluding slope estimation), JouleGrad warns and clamps.
+    \item \textbf{\texttt{clamp}}: Restricts coordinates to the measured range \emph{before} calculating weights, returning the nearest edge energy. Because the derivative is zero in clamped regimes, optimizers receive no gradient to return inside bounds.
+    \item \textbf{\texttt{warn}}: Behaves like \texttt{clamp} but raises a \texttt{RuntimeWarning} per out-of-bounds evaluation, aiding interactive debugging.
 \end{itemize}
 
-\textbf{Sparse-grid handling}: For missing internal points, \texttt{warn}, \texttt{clamp}, and \texttt{extrapolate} fall back to the nearest measured cell (or nearest Conv2d configuration). \texttt{warn} will log this, while the others remain silent.
+\textbf{Sparse-grid handling}: For unmeasured internal coordinates, non-strict modes fall back to the nearest measured cell (logging warnings under \texttt{warn}).
 
-If an axis only has one measured value, exact queries work in all modes. For unmeasured queries, JouleGrad clamps silently under \texttt{clamp}, warns and clamps under \texttt{warn} and \texttt{extrapolate}, and raises an error under \texttt{error}.
-
-In \texttt{error} mode, a missing cell only causes a failure if it's actually needed for interpolation. If you query an exact measured point, it succeeds even if nearby corners are missing.
-
-Ideally, your measurements should cover all needed configurations so you can use \texttt{error} mode. In our experiments, we used \texttt{extrapolate} to keep training smooth while exploring sparse grid regions.
+In \texttt{error} mode, missing cells trigger exceptions only when queried during interpolation; exact coordinates evaluate cleanly even if neighboring grid corners are unmeasured. In our NAS experiments, we used \texttt{extrapolate} to prevent gradient interruption while exploring intermediate channel dimensions.
 
 \section{Performance architecture}
 
-During training, the energy estimator is called at every optimization step. Reading CSV files, looping over layers in Python, and moving data between the CPU and GPU would be too slow.
+During NAS optimization, the energy surrogate evaluates at every training step. Parsing CSV records, iterating over layers in pure Python, or transferring tensors across CPU--GPU buses would create intolerable bottlenecks.
 
-To maintain speed, JouleGrad follows a simple rule: \textbf{do the heavy work once during setup, and use fast PyTorch tensor operations for the training loop.}
+To maintain throughput, JouleGrad follows a foundational principle: \textbf{execute expensive table parsing during initialization, and execute vectorized PyTorch tensor operations during the training loop.}
 
 \subsection{Loading grids into PyTorch tensors}
 
@@ -182,7 +178,7 @@ energy_mj = prepared(masks)        # differentiable total
 details = prepared.estimate(masks) # per-layer breakdown
 \end{lstlisting}
 
-For a quick, one-off check (like in a notebook), you can use \texttt{estimator.estimate\_model(...)}. This helper prepares the model and runs the estimation in one step. For training, always use the two-step \texttt{prepare\_model} approach so you don't scan the architecture on every batch.
+For a quick check (like in a notebook), you can call \texttt{estimator.}\allowbreak\texttt{estimate\_model(...)}. This helper prepares the model and runs the estimation in one step. For training, always use the two-step \texttt{prepare\_model} approach so you don't scan the architecture on every batch.
 
 In architectures like ResNet, skip connections sum the outputs of different branches. For this to work, both branches must share the exact same number of channels and pruning mask. PyTorch modules do not expose this topology automatically. Therefore, JouleNAS explicitly tracks these shared masks across residual blocks and calls JouleGrad's batch functions directly.
 

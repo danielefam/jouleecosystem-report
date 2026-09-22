@@ -3,22 +3,22 @@
 \addcontentsline{toc}{chapter}{Introduction}
 \markboth{Introduction}{}
 
-This document is both an internship report and a practical guide. It explains what we built, how the pieces fit together, and how to take new energy measurements. You do not need prior knowledge of the project to follow along. Every chapter starts with a quick test to make sure things work, followed by the commands to run the full suite. Since working with hardware can be tricky, the text warns you about common issues in advance.
+This document is both an academic internship report and a practical engineering guide. It explains what we built, how the components interact, and how to profile new hardware. You do not need prior familiarity with the codebase to follow along. Every chapter starts with a quick sanity check to confirm hardware communication, followed by the exact commands needed to run full campaigns. Because embedded systems can be unpredictable, the text flags common pitfalls in advance.
 
 \section*{The big picture}
 
-This project studies the energy consumption of AI models on edge devices (like the Raspberry~Pi~5 and Jetson boards) and uses this data to guide Neural Architecture Search. The work is split across three main tools:
+This project investigates the energy cost of neural network inference on edge devices (such as the Raspberry~Pi~5 and NVIDIA Jetson platforms) and uses physical measurements to guide hardware-aware Neural Architecture Search (NAS). The workflow connects three specialized tools:
 
 \begin{itemize}
-    \item \textbf{JouleQuest (Measurement)}: Runs tests on a target board and records power draw using an INA226EVM sensor. A single command gives you clean data in CSV and JSON formats.
-    \item \textbf{JouleGrad (Estimation)}: Turns JouleQuest measurements into differentiable energy estimates for common layers (like \texttt{Linear} and \texttt{Conv2d}). This allows us to use energy consumption as a penalty during training.
-    \item \textbf{JouleNAS (Search)}: A Neural Architecture Search pipeline that uses JouleGrad's estimates to find network architectures that are both accurate and energy-efficient.
+    \item \textbf{JouleQuest (Measurement)}: Runs automated campaigns on target hardware and records power traces with an INA226 sensor, producing clean, structured CSV and JSON datasets with a single command.
+    \item \textbf{JouleGrad (Estimation)}: Converts empirical layer profiles into differentiable, multilinear energy surrogates, enabling PyTorch optimizers to penalize energy directly during training.
+    \item \textbf{JouleNAS (Search)}: Prunes convolutional channels on frozen backbones to discover architectures that balance classification accuracy against real hardware energy.
 \end{itemize}
 
-A final chapter connects everything: measure with JouleQuest, build the lookup table, estimate with JouleGrad, and search with JouleNAS.
+A dedicated synthesis chapter (Chapter~4: The Bridge) connects the entire pipeline end-to-end: profile with JouleQuest, compile the lookup table, estimate with JouleGrad, search with JouleNAS, and validate the pruned model back on physical silicon.
 
 \section*{How to read this document}
 
-Each chapter is self-contained, so you can jump directly to the tool you need. If you need to take new measurements, start with the JouleQuest chapter. It covers wiring, software setup, quick tests, and the main campaign commands.
+Each chapter is modular and self-contained, allowing you to jump directly to the tool you need. If you are collecting new measurements, start with Chapter~1 (JouleQuest), which covers wiring, software setup, dry runs, and campaign orchestration.
 
-A quick disclaimer: hardware setups are fragile and each board behaves slightly differently. If a command fails, check the wiring and troubleshooting notes first. Configuration issues are much more common than software bugs.
+A quick note of caution: embedded setups are sensitive to voltage drops, thermal build-up, and cable quirks. If an experiment fails, check the physical wiring, power supply ratings, and SSH authentication first. Configuration issues are far more common than software bugs.
