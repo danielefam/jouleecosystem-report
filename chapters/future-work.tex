@@ -1,39 +1,30 @@
 % !TeX root = ../report_jouleecosystem.tex
 \chapter{Future Work}
+\label{chap:future_work}
 
-Most experiments in this project focused on single-sample inference ($\text{batch size} = 1$), reflecting real-time edge robotics where decisions happen frame-by-frame, before expanding to batch size 32 on the NVIDIA Jetson AGX Orin to study GPU launch amortization. With the end-to-end pipeline now fully established---from physical acquisition to differentiable search and real-silicon deployment (Chapter~\ref{chap:bridge})---several exciting research directions remain open.
+All experiments in this project use a batch size of 1. Every idea proposed below keeps this assumption, because our tools (JouleGrad and JouleNAS) focus on the energy cost of a single input.
 
 \section{Measurement layer (JouleQuest)}
 
-The central open question in the measurement layer is the composability gap: the energy of a full network is close to, but not exactly, the sum of its individual constituent layers. The difference ranges from under $5\%$ on Jetson platforms to roughly $20{-}25\%$ on the Raspberry~Pi~5.
+The biggest open problem in the pipeline is here: the energy of a full network is close to, but not exactly, the sum of its individual layers. The gap ranges from about $2\%$ on Jetson boards to roughly $25\%$ on the Raspberry~Pi~5. We suspect this is due to cache effects: standalone operations run with hot caches, but a full network exceeds cache capacity, causing extra energy costs from moving data around.
 
-We suspect this divergence stems from cache hierarchy behavior: standalone layer operations execute in tight benchmark loops with hot caches, whereas a complete network rapidly cycles intermediate feature maps through DRAM. Section~\ref{sec:sum-of-parts} outlines the baseline numbers and reasoning. If you pick up this project, the most impactful measurement tasks are:
+We will not repeat all the details here. You can find the numbers, the reasoning, and the next steps (like using performance counters to confirm the cache theory and correcting the estimator) in Section~\ref{sec:sum-of-parts} of the JouleQuest chapter. If you pick up this project, start there.
+
+Beyond fixing this gap, two measurement improvements would help the entire pipeline:
 
 \begin{itemize}
-    \item \textbf{Confirm cache behavior with hardware performance counters (PMUs)}:
-    Collect low-level cache-miss metrics using Linux \texttt{perf} or ARM/NVIDIA PMU registers during both standalone and whole-network runs. Correlating last-level cache (LLC) misses and DRAM bus traffic directly with the measured energy gap will turn our cache hypothesis into verified fact.
-    
-    \item \textbf{Fresh-board validation and inter-board variability}:
-    Our original Jetson Nano experienced a hardware failure before final verification. Re-running a core subset of tests on a replacement board will confirm that physical energy profiles remain stable across distinct physical units of the same model.
-
-    \item \textbf{Adaptive and denser lookup grids}:
-    JouleGrad estimates unmeasured layer shapes via multilinear interpolation. While accurate along smooth regions, interpolation error grows where hardware execution characteristics change sharply (such as transitions between cache sizes or GPU warp tiling boundaries). Measuring targeted points in these sensitive regions will refine grid precision without requiring an exhaustive brute-force sweep.
+    \item \textbf{Fresh-board validation}: The Jetson Nano used for most tests broke before we could finish. A replacement board should re-run a small set of the original tests to see if the new measurements match the old ones. This validates the new hardware and shows if energy numbers are consistent across identical boards.
+    \item \textbf{Denser lookup grids}: JouleGrad estimates unknown sizes by interpolating between measured points. In regions where energy changes quickly, these estimates are less reliable. We should measure a few extra points in these sparse regions to see where the grid needs more data.
 \end{itemize}
 
-\section{Estimation and search layers (JouleGrad and JouleNAS)}
+\section{Search layer (JouleNAS)}
 
-With physical validation on real hardware and systematic $\lambda_E$ sweeps now verified, the search framework is ready for broader exploration:
+Our current experiments search for energy-aware channel masks on SimpleConv and ResNet-18 (CIFAR-10 and Imagenette). While we performed initial hardware validation on specific ResNet-18 checkpoints (Chapter~\ref{chap:bridge}), broader questions remain open:
 
 \begin{itemize}
-    \item \textbf{Hardware-calibrated composability correction}:
-    JouleGrad currently predicts network energy by summing individual layer estimates. Feeding empirical composition data back into the estimator---either through a simple per-board scaling factor $C_{\text{board}}$ or a memory-aware residual term---would allow JouleNAS to optimize directly for composed network energy rather than isolated layer sums.
-
-    \item \textbf{Cross-dataset and transfer learning}:
-    Does an energy-optimal mask discovered on CIFAR-10 generalize effectively to other datasets on the same board? Fine-tuning just the linear classifier on a transfer task while freezing the pruned convolutional backbone will reveal whether structural channel sparsity depends on dataset features or primarily reflects underlying hardware efficiency.
-
-    \item \textbf{Extending beyond ResNet backbones}:
-    Our search targeted ResNet-18 and SimpleConv. Extending the spec-driven pipeline to depthwise separable networks (MobileNetV3) and edge Vision Transformers (ViTs)---profiling multi-head self-attention and patch embeddings in JouleQuest---will open hardware-aware NAS to the latest generation of edge vision backbones.
-
-    \item \textbf{Dynamic and on-device adaptation}:
-    Rather than discovering a single static pruned architecture, the framework could incorporate runtime gating or early-exit branches. Dynamically modulating active channels based on real-time thermal throttling or battery level would bring truly adaptive, hardware-aware execution to edge devices.
+    \item \textbf{Deploy the pruned network on real boards}: Take the architectures selected by our search and measure them with JouleQuest. Testing whether predicted savings match real board measurements across the full spectrum of models is the ultimate test for the pipeline.
+    \item \textbf{Test board-specific architectures}: Different boards have different costs (for example, convolutions cost more on CPUs than GPUs). Running the search with different lookup tables will show if the tool actually finds different ``best'' architectures for a Raspberry~Pi compared to an AGX Orin.
+    \item \textbf{Energy-weight sweeps}: While we explored penalty values for ResNet-18, systematic sweeps across other models will provide complete accuracy--energy trade-off curves for each board.
+    \item \textbf{From masks to real deployment}: Right now, the search outputs channel masks. To finish the job across different models, we need to physically prune those channels, build the smaller model, and measure it on hardware to confirm that the predicted savings hold in reality.
+    \item \textbf{Cross-dataset transfer}: Does an energy-optimal mask for one dataset work well for another on the same board? A quick experiment (keeping the masks and retraining just the classifier) would show if the pruned structure depends on the dataset or just the hardware.
 \end{itemize}

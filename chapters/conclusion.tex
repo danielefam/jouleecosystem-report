@@ -1,14 +1,14 @@
 % !TeX root = ../report_jouleecosystem.tex
 \chapter{Conclusion}
 
-This report documented the three interconnected parts of the energy-aware deep learning ecosystem built during this internship, following the data flow from physical silicon to training loops:
+This report describes the three parts of the energy-aware pipeline built during this internship, following how data flows through them.
 
-\textbf{JouleQuest} turned a fragile, manual measurement procedure into a robust, automated pipeline. Using single-command execution, adaptive burst sizing, and host-target clock synchronization, its campaign launcher profiles hundreds of layer configurations over multi-day acquisition sessions and resumes automatically after interruptions. It delivers empirical energy lookup tables for \texttt{Linear}, \texttt{Conv2d}, and \texttt{Attention} operators across diverse edge devices.
+\textbf{JouleQuest} automated a manual and fragile measurement process. It uses a single command per experiment, adaptive burst sizing, and clock synchronization between the PC and the board. Its campaign launcher can measure a full matrix of layers over several days, picking up right where it left off. The result is a set of energy lookup tables for layers like Linear, Conv, and Attention, all measured on real hardware at batch size 1.
 
-\textbf{JouleGrad} transforms these empirical tables into continuous, differentiable surrogates inside PyTorch training loops. Its multilinear interpolation produces analytical energy gradients without discrete noise, while strict out-of-range policies safeguard against unmeasured extrapolation artifacts.
+\textbf{JouleGrad} makes these tables usable inside a training loop. It provides differentiable energy estimates and clear rules for handling inputs outside the measured regions, avoiding silent errors or zero-cost layers.
 
-\textbf{JouleNAS} guides neural architecture search with physical energy gradients, pruning redundant channels from deep models while balancing task accuracy against hardware power. Sweeping the energy penalty establishes empirical Pareto frontiers, while an inverse scaling law enables reliable hyperparameter transfer across different hardware targets.
+\textbf{JouleNAS} closes the loop by using the measured energy as a penalty during neural architecture search (for SimpleConv and ResNet-18). This ensures the discovered architectures are optimized for their actual energy cost on the target board.
 
-Finally, \textbf{The Bridge} validates the discovered sub-networks back on physical silicon through a spec-driven materialization pipeline. Deploying real, structurally pruned models confirmed real-world energy reductions of up to $60.1\%$ on the Raspberry~Pi~5 and $20.0\%$ on the NVIDIA Jetson AGX Orin, comfortably preserving baseline accuracy.
+For ResNet-18, \textbf{The Bridge} demonstrated physical hardware validation on real silicon, confirming real-world energy reductions of up to $60.1\%$ on the Raspberry~Pi~5 and $20.0\%$ on the NVIDIA Jetson AGX Orin while preserving baseline accuracy.
 
-The central takeaway of this work is that physical energy measurements expose hardware nuances that theoretical metrics cannot capture. With automated acquisition, differentiable estimation, hardware-guided search, and physical validation now unified end-to-end, the ecosystem provides a solid, accessible foundation for the next researcher to build upon.
+The main lesson of this work is also its biggest open challenge: the energy of a full network is almost, but not exactly, the sum of its parts. The difference (up to $25\%$ on the Raspberry~Pi~5) points to cache effects that isolated measurements miss. Section~\ref{sec:sum-of-parts} presents the evidence and next steps, and Chapter~\ref{chap:future_work} lays out tasks for each part of the pipeline. The tools, measurements, and open questions are all ready for the next person to take over the project.

@@ -198,7 +198,7 @@ This split means you only train the heavy baseline once, and can run many quick 
 
 A quick tip: your lookup table needs to cover the model's operators at the chosen input size. You can pass \texttt{--energy-out-of-range error} to strictly enforce this, or use a softer JouleGrad policy like \texttt{extrapolate} if your table is incomplete (we used this one).
 
-Each run outputs a metrics CSV (tracking accuracy, active channels, and energy) and a final mask checkpoint, which is ready for physical deployment and hardware validation (Chapter~\ref{chap:bridge}).
+Each run outputs a metrics CSV (tracking accuracy, active channels, and energy) and a final mask checkpoint, ready for physical deployment (tested on ResNet-18 in Chapter~\ref{chap:bridge} and discussed as future work in Chapter~\ref{chap:future_work}).
 
 \section{Experimental results and what they tell us}
 \label{sec:experimental_results}
